@@ -1,0 +1,149 @@
+# frozen_string_literal: true
+
+RSpec.describe SecurityBox::Sandbox do
+  subject(:sandbox) { described_class.new }
+
+  # Integration suite against the real ruby.wasm: each eval spawns a sandbox.
+  # Per-test timeout so a failing kill doesn't hang the suite.
+  around do |example|
+    Timeout.timeout(30) { example.run }
+  end
+
+  describe "#eval" do
+    it "runs simple code and returns the value with captured stdout" do
+      result = sandbox.eval("puts 'hello'; 40 + 2")
+
+      expect(result).to be_ok
+      expect(result.status).to eq(:ok)
+      expect(result.value).to eq(42)
+      expect(result.stdout).to eq("hello\n")
+      expect(result.fuel_used).to be > 0
+      expect(result.duration_ms).to be > 0
+    end
+
+    it "supports multiple runs on the same object" do
+      expect(sandbox.eval("1 + 1").value).to eq(2)
+      expect(sandbox.eval("3 * 3").value).to eq(9)
+    end
+
+    it "serializes simple objects as the value" do
+      expect(sandbox.eval('{ "a" => 1, :b => [true, nil] }').value).to eq({ "a" => 1, "b" => [true, nil] })
+    end
+
+    it "serializes non-JSON values as strings" do
+      result = sandbox.eval("Object.new")
+
+      expect(result).to be_ok
+      expect(result.value).to be_a(String)
+    end
+
+    context "when the user code raises an exception" do
+      it "returns :error status with class and message" do
+        result = sandbox.eval('raise ArgumentError, "boom"')
+
+        expect(result).not_to be_ok
+        expect(result.status).to eq(:error)
+        expect(result.error["class"]).to eq("ArgumentError")
+        expect(result.error["message"]).to eq("boom")
+      end
+
+      it "captures SystemExit as an error (exit does not kill the host)" do
+        result = sandbox.eval("exit 7")
+
+        expect(result.status).to eq(:error)
+        expect(result.error["class"]).to eq("SystemExit")
+      end
+    end
+
+    context "with an infinite loop" do
+      it "epoch interruption returns :timeout in ~timeout_ms" do
+        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        result = sandbox.eval("while true; end", timeout_ms: 500)
+        wall = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+
+        expect(result.status).to eq(:timeout)
+        expect(wall).to be_between(0.4, 2.0)
+      end
+
+      it "fuel interruption returns :fuel_exhausted" do
+        result = sandbox.eval("while true; end", fuel: 1_000_000)
+
+        expect(result.status).to eq(:fuel_exhausted)
+      end
+    end
+
+    context "with a memory limit" do
+      it "returns :memory_limit when the guest exceeds memory_size" do
+        result = sandbox.eval("a = []; loop { a << ('x' * 1024) }", memory_size: 128 * 1024 * 1024, timeout_ms: 15_000)
+
+        expect(result.status).to eq(:memory_limit)
+      end
+    end
+
+    context "with output above the limit" do
+      it "truncates stdout to the configured limit" do
+        result = sandbox.eval('1000.times { print "x" * 1000 }', stdout_limit: 4096)
+
+        expect(result.stdout.bytesize).to be <= 4096
+      end
+    end
+  end
+end
+
+RSpec.describe "sandbox isolation" do
+  subject(:sandbox) { SecurityBox::Sandbox.new }
+
+  around do |example|
+    Timeout.timeout(30) { example.run }
+  end
+
+  # NotImplementedError/LoadError inherit from ScriptError, not StandardError —
+  # hence the guest needs rescue Exception here.
+  def rescued_result(code, **opts)
+    sandbox.eval("begin; (#{code}); rescue Exception => ex; \"RESCUED:\#{ex.class}\"; end", **opts)
+  end
+
+  it "does not write outside /work" do
+    result = rescued_result("File.write('/etc/passwd', 'pwned')")
+
+    expect(result.value).to eq("RESCUED:Errno::ENOENT")
+    expect(File.read("/etc/passwd")).not_to include("pwned")
+  end
+
+  it "cannot see the host filesystem" do
+    result = sandbox.eval('Dir["/*"].empty?')
+
+    expect(result.value).to be(true)
+  end
+
+  it "does not execute processes (system is a no-op stub)" do
+    sandbox.eval("system('touch /tmp/security_box_pwned')")
+
+    # system returns true on wasip1, but nothing runs — the file must not exist
+    expect(File.exist?("/tmp/security_box_pwned")).to be(false)
+  end
+
+  it "has no fork" do
+    result = rescued_result("fork")
+
+    expect(result.value).to eq("RESCUED:NotImplementedError")
+  end
+
+  it "has no sockets" do
+    result = rescued_result("require 'socket'")
+
+    expect(result.value).to eq("RESCUED:LoadError")
+  end
+
+  it "has no threads" do
+    result = rescued_result("Thread.new { 1 }")
+
+    expect(result.value).to eq("RESCUED:NotImplementedError")
+  end
+
+  it "has empty ENV" do
+    result = sandbox.eval("ENV.to_h")
+
+    expect(result.value).to eq({})
+  end
+end

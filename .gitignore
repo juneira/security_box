@@ -1,0 +1,7 @@
+build/
+tmp/
+.bundle
+vendor/
+ruby-4.0-wasm32-unknown-wasip1-full/
+ruby-4.0-wasm32-unknown-wasip1-full.tar.gz
+Gemfile.lock
