@@ -16,5 +16,5 @@ Rules and conventions of this project for agents and collaborators.
 ## Conventions
 
 - `docs/plan/` documents the plan and the stages; these are living documents.
-- The built image (`build/security_box.wasm`) is not committed to git; repack
-  after changing `lib/security_box/guest/*.rb`.
+- The built image (`lib/security_box/assets/security_box.wasm`) is not committed
+  to git; repack after changing `lib/security_box/guest/*.rb`.

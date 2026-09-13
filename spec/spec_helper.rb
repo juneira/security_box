@@ -12,7 +12,7 @@ RSpec.configure do |config|
 end
 
 # Ensure the image exists before the integration tests
-IMAGE_PATH = File.expand_path("../build/security_box.wasm", __dir__)
+IMAGE_PATH = File.expand_path("../lib/security_box/assets/security_box.wasm", __dir__)
 
 RSpec.configure do |config|
   config.before(:suite) do

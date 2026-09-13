@@ -3,7 +3,9 @@
 module SecurityBox
   # Immutable sandbox configuration. Use .build to create and #with to derive.
   class Configuration
-    IMAGE_RELATIVE_DEFAULT = "../../build/security_box.wasm"
+    IMAGE_ENV_VAR = "SECURITY_BOX_IMAGE"
+    IMAGE_ASSET_RELATIVE = "assets/security_box.wasm"
+    IMAGE_DEV_RELATIVE = "../../build/security_box.wasm"
 
     DEFAULTS = {
       image_path: nil, # resolved dynamically (project's build/security_box.wasm)
@@ -55,13 +57,21 @@ module SecurityBox
 
     private
 
+    # Resolution order (first existing path wins):
+    #   1. SECURITY_BOX_IMAGE environment variable
+    #   2. the image packed inside this library (gem install or checkout)
+    #   3. legacy development output (build/security_box.wasm)
     def default_image_path
-      path = File.expand_path(IMAGE_RELATIVE_DEFAULT, __dir__)
-      return path if File.exist?(path)
+      candidates = [ENV[IMAGE_ENV_VAR],
+                    File.expand_path(IMAGE_ASSET_RELATIVE, __dir__),
+                    File.expand_path(IMAGE_DEV_RELATIVE, __dir__)].compact
+      path = candidates.find { |candidate| File.file?(candidate) }
+      return path if path
 
       raise ImageMissing,
-            "Sandbox image not found at #{path}. " \
-            "Run `rake security_box:build_image` or pass image_path in the configuration."
+            "Sandbox image not found. Tried: #{candidates.join(', ')}. " \
+            "Run `rake security_box:build_image`, set #{IMAGE_ENV_VAR}, " \
+            "or pass image_path in the configuration."
     end
   end
 end

@@ -1,5 +1,8 @@
 # security_box
 
+[![Gem Version](https://img.shields.io/gem/v/security_box)](https://rubygems.org/gems/security_box)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A secure sandbox to run untrusted Ruby code, built on top of
 [ruby.wasm](https://github.com/ruby/ruby.wasm) and the
 [wasmtime](https://github.com/bytecodealliance/wasmtime-rb) gem.
@@ -26,26 +29,45 @@ One wasm process per `#eval` means zero residual state between executions.
 ## Requirements
 
 - Ruby >= 4.0 (host)
-- `wasmtime` gem (runtime) and `ruby_wasm` gem (build-time only) — see `Gemfile`
+- `wasmtime` gem (runtime) — the only runtime dependency
+- `ruby_wasm` gem (build-time only, needed to rebuild the sandbox image)
 
 ## Setup
 
-Add to your `Gemfile`:
+Install from RubyGems:
 
-```ruby
-gem "security_box", path: "." # or your gem source
+```bash
+gem install security_box
 ```
 
-Then build the sandbox image (downloads `ruby-4.0-wasm32-unknown-wasip1-full` and packs it
-with the guest script):
+Or add to your `Gemfile`:
+
+```ruby
+gem "security_box"
+```
+
+The gem ships a prebuilt sandbox image (`lib/security_box/assets/security_box.wasm`,
+about 110MB), so no network access or build tools are needed at install or at
+runtime.
+
+### Rebuilding the image (development only)
+
+If you change `lib/security_box/guest/*.rb` or bump the pinned ruby.wasm
+release, repack the sandbox image:
 
 ```bash
 bundle install
 bundle exec rake security_box:build_image
 ```
 
-The image is written to `build/security_box.wasm` (about 110MB). It is not committed to
-git — repack it after changing `lib/security_box/guest/*.rb`.
+This downloads the pinned ruby.wasm release (`2.10.1`, see the `Rakefile`) and
+packs it with the guest script into `lib/security_box/assets/security_box.wasm`.
+The task skips repacking when the image is already fresh. The image is not
+committed to git.
+
+You can point the library at a different image with the `SECURITY_BOX_IMAGE`
+environment variable or by passing `image_path:` in the configuration — useful
+for custom-built images.
 
 ## Usage
 
@@ -182,9 +204,18 @@ Notes:
 bundle exec rspec spec/
 ```
 
-The integration suite runs against the real ruby.wasm image. If `build/security_box.wasm`
-is missing, the suite builds it automatically before running (this may take a few minutes
-the first time).
+The integration suite runs against the real ruby.wasm image. If the image at
+`lib/security_box/assets/security_box.wasm` is missing, the suite builds it
+automatically before running (this may take a few minutes the first time).
+
+## Releasing
+
+1. Rebuild the image if needed: `bundle exec rake security_box:build_image`
+   (also runs automatically before `rake build`/`rake release`).
+2. Verify it is fresh: `bundle exec rake security_box:verify_image`
+3. Run the suite: `bundle exec rake spec`
+4. Build and publish: `bundle exec rake release` (tags git and pushes the gem
+   to RubyGems.org)
 
 ## Learning spike
 

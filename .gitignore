@@ -1,4 +1,5 @@
-build/
+lib/security_box/assets/
+pkg/
 tmp/
 .bundle
 vendor/

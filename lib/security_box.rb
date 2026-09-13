@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative "security_box/version"
 require_relative "security_box/errors"
 require_relative "security_box/configuration"
 require_relative "security_box/result"

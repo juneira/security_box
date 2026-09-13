@@ -8,7 +8,7 @@ require "wasmtime"
 require "json"
 require "tmpdir"
 
-IMAGE_PATH = File.expand_path("../build/security_box.wasm", __dir__)
+IMAGE_PATH = File.expand_path("../lib/security_box/assets/security_box.wasm", __dir__)
 INTERVAL_MS = 25
 
 $times = Hash.new { |h, k| h[k] = [] }

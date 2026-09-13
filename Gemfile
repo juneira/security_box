@@ -5,8 +5,10 @@ source "https://rubygems.org"
 # Runtime: wasmtime embedding (engine + WASI p1)
 gem "wasmtime"
 
-# Build-time: `rbwasm` CLI to pack the ruby.wasm image
-gem "ruby_wasm"
+group :development do
+  # Build-time: `rbwasm` CLI to pack the ruby.wasm image (not a runtime dep)
+  gem "ruby_wasm"
+end
 
 group :development, :test do
   gem "rake"
