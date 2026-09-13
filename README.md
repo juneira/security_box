@@ -63,6 +63,23 @@ result.fuel_used # => > 0
 result.duration_ms # => 257.0 (approx; dominated by the ruby.wasm boot)
 ```
 
+### Warming up
+
+The first `eval` in a process pays the cold WebAssembly compilation of the image
+(~15s) plus the engine setup. Call `SecurityBox.warmup` ahead of time (e.g., at
+boot) to pay that cost up front — every subsequent `eval` then only pays the
+~240ms guest boot:
+
+```ruby
+SecurityBox.warmup
+
+SecurityBox.eval("40 + 2").value # => 42 (~250ms, no cold compile)
+```
+
+`#eval` warms the same caches lazily on first use, so calling `warmup` is a pure
+optimization — behavior and results are identical without it. It accepts the same
+options as `Configuration.build` and is safe to call multiple times.
+
 ### Multiple evaluations on the same sandbox
 
 ```ruby
