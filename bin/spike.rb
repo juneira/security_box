@@ -124,21 +124,21 @@ puts "ruby #{RUBY_VERSION} | image: #{IMAGE_PATH} (#{File.size(IMAGE_PATH) / 102
 
 # Q1/Q2: basic execution + stdout capture (via /work)
 r = run("puts 'hello from wasm'; 40 + 2")
-log("Q1", "exec básica: status=#{r[:status]} stdout=#{r[:stdout].inspect} value=#{r[:out]&.dig(:source) ? r[:out][:data]['value'] : r[:out]&.data&.dig('value')} out_via=#{r[:out][:source]} invoke=#{r[:invoke_ms]}ms")
+log("Q1", "basic exec: status=#{r[:status]} stdout=#{r[:stdout].inspect} value=#{r[:out]&.dig(:source) ? r[:out][:data]['value'] : r[:out]&.data&.dig('value')} out_via=#{r[:out][:source]} invoke=#{r[:invoke_ms]}ms")
 
 # Q3/Q4: sentinel fallback (no /work)
 r2 = run("puts 'no workdir'; 7 * 6", use_work_dir: false)
-log("Q3", "sem /work: status=#{r2[:status]} out_via=#{r2[:out][:source]} value=#{r2[:out][:data]['value']}")
+log("Q3", "without /work: status=#{r2[:status]} out_via=#{r2[:out][:source]} value=#{r2[:out][:data]['value']}")
 
 # Q5a: epoch — infinite loop
 r3 = run("while true; end", timeout_ms: 500)
-log("Q5", "loop infinito (epoch 500ms): status=#{r3[:status]} invoke=#{r3[:invoke_ms]}ms fuel_used=#{r3[:fuel_used]}")
+log("Q5", "infinite loop (epoch 500ms): status=#{r3[:status]} invoke=#{r3[:invoke_ms]}ms fuel_used=#{r3[:fuel_used]}")
 
 # Q5b: fuel — calibrate fuel/second consumption
 budget = 20_000_000_000
 r4 = run("while true; end", fuel: budget, timeout_ms: 3_000)
 rate = r4[:fuel_used] / (r4[:invoke_ms] / 1000.0)
-log("Q5", "loop infinito (fuel): status=#{r4[:status]} fuel_used=#{r4[:fuel_used]} (#{rate.round} fuel/s) invoke=#{r4[:invoke_ms]}ms")
+log("Q5", "infinite loop (fuel): status=#{r4[:status]} fuel_used=#{r4[:fuel_used]} (#{rate.round} fuel/s) invoke=#{r4[:invoke_ms]}ms")
 
 # Q6: spawn cost (module already compiled) — 5 "hello" spawns
 rss_start = rss_mb
@@ -148,8 +148,8 @@ spawn_times = 5.times.map do
   x[:store_ms] + x[:inst_ms] + x[:invoke_ms]
 end
 puts
-log("Q6", "spawn total (store+inst+invoke) 5x: #{spawn_times.map { |t| t.round(1) }.join(', ')} ms | rss inicio=#{rss_start.round}MB fim=#{rss_mb.round}MB")
-log("Q6", "módulo compilado 1x: #{$times['module_compile'].first.round(1)}ms (cache de Module reusado depois)")
+log("Q6", "total spawn (store+inst+invoke) 5x: #{spawn_times.map { |t| t.round(1) }.join(', ')} ms | rss start=#{rss_start.round}MB end=#{rss_mb.round}MB")
+log("Q6", "module compiled once: #{$times['module_compile'].first.round(1)}ms (Module cache reused afterwards)")
 
 # Q7: isolation
 probes = {
@@ -172,7 +172,7 @@ end
 
 # Q8: memory limit
 r8 = run("a = []; loop { a << ('x' * 1024) }", memory_size: 128 * 1024 * 1024, timeout_ms: 5_000)
-log("Q8", "memory_size=128MB + alocação infinita: status=#{r8[:status]} mem_hit=#{r8[:mem_hit]} stderr=#{r8[:stderr].inspect[0, 160]}")
+log("Q8", "memory_size=128MB + infinite allocation: status=#{r8[:status]} mem_hit=#{r8[:mem_hit]} stderr=#{r8[:stderr].inspect[0, 160]}")
 
 # Q9: concurrency — 4 threads with infinite loops (500ms each); total wall should be ~500ms, not ~2000ms
 t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -183,7 +183,7 @@ threads = 4.times.map do
 end
 results9 = threads.map(&:value)
 wall9 = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000
-log("Q9", "4 loops infinitos paralelos: wall=#{wall9.round}ms (esperado ~500-600ms se GVL é liberado) status=#{results9.map { |x| x[:status] }.join(',')}")
+log("Q9", "4 parallel infinite loops: wall=#{wall9.round}ms (expected ~500-600ms if GVL is released) status=#{results9.map { |x| x[:status] }.join(',')}")
 
 # Q9b: 4 threads x fast boot (no loop) — separates boot serialization from wasm serialization
 t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -191,9 +191,9 @@ threads = 4.times.map { Thread.new { run("1") } }
 results9b = threads.map(&:value)
 wall9b = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000
 serial_ms = results9b.sum { |x| x[:invoke_ms] }
-log("Q9b", "4 boots paralelos: wall=#{wall9b.round}ms vs soma serial=#{serial_ms.round}ms (ratio=#{(wall9b / serial_ms).round(2)})")
+log("Q9b", "4 parallel boots: wall=#{wall9b.round}ms vs serial sum=#{serial_ms.round}ms (ratio=#{(wall9b / serial_ms).round(2)})")
 
-puts "\n== médianas (ms) =="
+puts "\n== medians (ms) =="
 $times.each do |k, v|
   next if k == "module_compile"
   sorted = v.sort

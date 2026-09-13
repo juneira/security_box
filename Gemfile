@@ -2,10 +2,10 @@
 
 source "https://rubygems.org"
 
-# Runtime: embedding do wasmtime (engine + WASI p1)
+# Runtime: wasmtime embedding (engine + WASI p1)
 gem "wasmtime"
 
-# Build-time: CLI `rbwasm` para empacotar a imagem ruby.wasm
+# Build-time: `rbwasm` CLI to pack the ruby.wasm image
 gem "ruby_wasm"
 
 group :development, :test do

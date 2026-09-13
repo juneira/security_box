@@ -1,21 +1,20 @@
 # AGENTS.md
 
-Regras e convenções deste projeto para agentes e colaboradores.
+Rules and conventions of this project for agents and collaborators.
 
-## Idioma
+## Language
 
-1. Todo conteúdo em `docs/` deve estar em português (pt-BR).
-2. Comentários no código Ruby (`lib/`, `spec/`, `bin/`, `Rakefile`) devem estar em inglês.
-3. Descrições dos specs (`it`, `describe`, `context`) devem estar em inglês.
+1. All content in this project (docs, code comments, spec descriptions, log
+   messages, error messages) must be in English.
 
-## Comandos
+## Commands
 
-- Testes: `bundle exec rspec spec/`
-- Build da imagem do sandbox: `bundle exec rake security_box:build_image`
-- Spike de aprendizado (requer imagem buildada): `bundle exec ruby bin/spike.rb`
+- Tests: `bundle exec rspec spec/`
+- Sandbox image build: `bundle exec rake security_box:build_image`
+- Learning spike (requires built image): `bundle exec ruby bin/spike.rb`
 
-## Convenções
+## Conventions
 
-- `docs/plan/` documenta o plano e as stages; são documentos vivos, sempre em português.
-- A imagem buildada (`build/security_box.wasm`) não vai para o git; repacotar após mudar
-  `lib/security_box/guest/*.rb`.
+- `docs/plan/` documents the plan and the stages; these are living documents.
+- The built image (`build/security_box.wasm`) is not committed to git; repack
+  after changing `lib/security_box/guest/*.rb`.

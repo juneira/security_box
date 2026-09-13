@@ -60,8 +60,8 @@ module SecurityBox
       return path if File.exist?(path)
 
       raise ImageMissing,
-            "Imagem do sandbox não encontrada em #{path}. " \
-            "Rode `rake security_box:build_image` ou passe image_path na configuração."
+            "Sandbox image not found at #{path}. " \
+            "Run `rake security_box:build_image` or pass image_path in the configuration."
     end
   end
 end

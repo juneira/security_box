@@ -1,198 +1,198 @@
-# Stage 1 — Spike de viabilidade
+# Stage 1 — Feasibility spike
 
-> Documento vivo: registramos aqui **o que queremos aprender** nesta fase e, ao final,
-> **o que aprendemos** (com números). O objetivo não é entregar a lib completa, e sim
-> reduzir a incerteza técnica do ruby.wasm + wasmtime-rb.
+> Living document: we record here **what we want to learn** in this phase and, at the end,
+> **what we learned** (with numbers). The goal is not to deliver the complete library, but to
+> reduce the technical uncertainty around ruby.wasm + wasmtime-rb.
 
-## 1. O que queremos entender nesta fase
+## 1. What we want to understand in this phase
 
-| # | Pergunta | Como vamos responder |
-|---|----------|----------------------|
-| Q1 | Conseguimos rodar um script Ruby dentro do ruby.wasm a partir do Ruby host, usando a gem `wasmtime`? | Empacotar um `guest/main.rb` com `rbwasm pack` e invocar `_start` via `Wasmtime::Linker` + WASI p1. |
-| Q2 | Como capturar stdout/stderr do guest de forma limitada? | `WasiConfig#set_stdout_buffer` / `#set_stderr_buffer` com capacidade máxima. |
-| Q3 | Como passar o código do usuário para dentro do sandbox? | Opção A: `argv` (`set_argv`); Opção B: arquivo em diretório mapeado (`set_mapped_directory` → `/work`). Validar as duas e escolher. |
-| Q4 | Como receber o resultado estruturado (valor, erro, duração) de volta? | Opção A: linha-sentinela no stdout (risco de forja); Opção B: `/work/out.json` (arquivo privado do sandbox). Validar o que funciona com o VFS embutido do `rbwasm pack`. |
-| Q5 | Loop infinito morre? Com qual custo? | `epoch_interruption` + `store.set_epoch_deadline` (wall-clock) e `consume_fuel` + `store.set_fuel`. Medir latência da interrupção. |
-| Q6 | Quanto custa spawnar um sandbox? | Tempo de: `Module.from_file` (uma vez, com cache), `Store.new`, `linker.instantiate`, `invoke("_start")` — frio vs quente. Pico de memória. |
-| Q7 | O que o guest NÃO consegue fazer (isolamento)? | Tentar `File.write("/etc/passwd")`, `Dir["/"]`, `system`, `fork`, `require "socket"`, `ENV`, `Thread.new` — tudo deve falhar graciosamente *dentro* do guest. |
-| Q8 | Memory limit do wasmtime funciona com o ruby.wasm? | `Store.new(limits: { memory_size: })` — o guest deve receber `MemoryOutOfBounds` (e o Ruby mapeia isso como `NoMemoryError`/trap). |
+| # | Question | How we will answer |
+|---|----------|--------------------|
+| Q1 | Can we run a Ruby script inside ruby.wasm from the host Ruby, using the `wasmtime` gem? | Pack a `guest/main.rb` with `rbwasm pack` and invoke `_start` via `Wasmtime::Linker` + WASI p1. |
+| Q2 | How to capture guest stdout/stderr in a bounded way? | `WasiConfig#set_stdout_buffer` / `#set_stderr_buffer` with maximum capacity. |
+| Q3 | How to pass user code into the sandbox? | Option A: `argv` (`set_argv`); Option B: file in a mapped directory (`set_mapped_directory` → `/work`). Validate both and choose. |
+| Q4 | How to receive the structured result (value, error, duration) back? | Option A: sentinel line on stdout (forging risk); Option B: `/work/out.json` (sandbox-private file). Validate what works with the embedded VFS of `rbwasm pack`. |
+| Q5 | Does an infinite loop die? At what cost? | `epoch_interruption` + `store.set_epoch_deadline` (wall-clock) and `consume_fuel` + `store.set_fuel`. Measure interruption latency. |
+| Q6 | How much does it cost to spawn a sandbox? | Time of: `Module.from_file` (once, with cache), `Store.new`, `linker.instantiate`, `invoke("_start")` — cold vs warm. Memory peak. |
+| Q7 | What the guest CANNOT do (isolation)? | Try `File.write("/etc/passwd")`, `Dir["/"]`, `system`, `fork`, `require "socket"`, `ENV`, `Thread.new` — all must fail gracefully *inside* the guest. |
+| Q8 | Does the wasmtime memory limit work with ruby.wasm? | `Store.new(limits: { memory_size: })` — the guest should get `MemoryOutOfBounds` (and Ruby maps that as `NoMemoryError`/trap). |
 
-## 2. Escopo desta fase
+## 2. Scope of this phase
 
-- Gemfile com `wasmtime` (runtime) + `ruby_wasm` (build) + `rspec` (testes).
-- Script de build da imagem (`rake security_box:build_image`): download do tarball pré-compilado
-  `ruby-4.0-wasm32-unknown-wasip1-full` e empacotamento com `rbwasm pack`.
-- Núcleo mínimo da lib: `SecurityBox::Sandbox#eval(code) -> Result` em modo `:oneshot`.
-- Specs cobrindo Q1–Q8 (incluindo a matriz de escapes básica).
-- `docs/plan/stages/stage_1.md` com os números medidos (esta seção 3).
+- Gemfile with `wasmtime` (runtime) + `ruby_wasm` (build) + `rspec` (tests).
+- Image build script (`rake security_box:build_image`): download of the prebuilt tarball
+  `ruby-4.0-wasm32-unknown-wasip1-full` and packing with `rbwasm pack`.
+- Minimal lib core: `SecurityBox::Sandbox#eval(code) -> Result` in `:oneshot` mode.
+- Specs covering Q1–Q8 (including the basic escape matrix).
+- `docs/plan/stages/stage_1.md` with the measured numbers (this section 3).
 
-## 3. Diário de aprendizado (log)
+## 3. Learning journal (log)
 
 ### Setup
 
 - Host: Ruby 4.0.5, Linux x86_64.
-- Gems: `wasmtime` 48.0.1 (pré-compilada) e `ruby_wasm` 2.10.1 (fornece o CLI `rbwasm`).
-- Imagem: download do release `ruby-4.0-wasm32-unknown-wasip1-full` (binário `ruby` = 36MB);
-  empacotada com `rbwasm pack ruby --dir <tarball>/usr::/usr --dir guest::/src` → **`build/security_box.wasm` de 110MB**.
-- **Armadilha 1**: empacotar só o binário (sem `usr::/usr`) deixa a imagem sem stdlib — `require "json"`
-  falha com `LoadError`. O diretório `usr` inteiro precisa ir para o VFS em `/usr`.
-- **Armadilha 2**: o ruby empacotado espera `argv = [program_name, script, *args]`. Com
-  `argv = [script, code]` o ruby trata `code` como nome do script (`LoadError`). Correto:
+- Gems: `wasmtime` 48.0.1 (precompiled) and `ruby_wasm` 2.10.1 (provides the `rbwasm` CLI).
+- Image: download of the release `ruby-4.0-wasm32-unknown-wasip1-full` (binary `ruby` = 36MB);
+  packed with `rbwasm pack ruby --dir <tarball>/usr::/usr --dir guest::/src` → **`build/security_box.wasm` at 110MB**.
+- **Pitfall 1**: packing only the binary (without `usr::/usr`) leaves the image without stdlib —
+  `require "json"` fails with `LoadError`. The whole `usr` directory must go into the VFS at `/usr`.
+- **Pitfall 2**: the packed ruby expects `argv = [program_name, script, *args]`. With
+  `argv = [script, code]` the ruby treats `code` as the script name (`LoadError`). Correct:
   `set_argv(["ruby", "/src/main.rb", code])` → script = `/src/main.rb`, `ARGV = [code]`.
 
-### Q1/Q2 — execução e captura de saída (RESOLVIDO)
+### Q1/Q2 — execution and output capture (RESOLVED)
 
 - `Wasmtime::Engine.new(consume_fuel: true, epoch_interruption: true)` + `Module.from_file` +
   `Wasmtime::Linker` + `Wasmtime::WASI::P1.add_to_linker_sync` + `Store.new(wasi_p1_config:)` +
-  `instance.invoke("_start")` roda o guest. ✅
-- `set_stdout_buffer(String.new, capacity)` escreve **no mesmo objeto String do host** e trunca no
-  limite. Mesmo padrão para stderr. ✅
-- Custo de boot do ruby.wasm: **~240ms por `invoke("_start")`** (p50, estável). `Store.new` ~0.03ms,
-  `instantiate` ~0.18ms (p50). O boot domina o custo de um sandbox `:oneshot`.
+  `instance.invoke("_start")` runs the guest. ✅
+- `set_stdout_buffer(String.new, capacity)` writes **into the same host String object** and truncates at
+  the limit. Same pattern for stderr. ✅
+- ruby.wasm boot cost: **~240ms per `invoke("_start")`** (p50, stable). `Store.new` ~0.03ms,
+  `instantiate` ~0.18ms (p50). Boot dominates the cost of a `:oneshot` sandbox.
 
-### Q3/Q4 — passagem de código e retorno de resultado (RESOLVIDO)
+### Q3/Q4 — code passing and result return (RESOLVED)
 
-- **Código via argv**: funciona sem shell (`set_argv`), ok para códigos curtos.
-- **Código via `/work/code.rb`**: `set_mapped_directory(tmpdir_host, "/work", :read_write)` em
-  runtime **coexiste** com o VFS embutido (`/usr`, `/src`) — o fallthrough do wasi-vfs funciona. ✅
-  Preferimos `/work/code.rb` (sem limite de tamanho de argv).
-- **Resultado via `/work/out.json`**: funciona ✅ (guest escreve envelope JSON; host lê do tmpdir).
-- **Resultado via sentinela no stdout** (fallback): funciona ✅.
-- ⚠️ Risco conhecido (registrado): código malicioso *dentro do guest* pode forjar o envelope
-  (ex.: `at_exit` sobrescrevendo `out.json`, ou imprimindo a sentinela). O canal é confiável contra
-  acidentes, não contra adversário ativo. Mitigações para Stage 2: token aleatório (ENV lido e
-  apagado pelo prelude), validação de schema no host, contagem de sentinelas.
+- **Code via argv**: works without a shell (`set_argv`), fine for short codes.
+- **Code via `/work/code.rb`**: `set_mapped_directory(tmpdir_host, "/work", :read_write)` at
+  runtime **coexists** with the embedded VFS (`/usr`, `/src`) — the wasi-vfs fallthrough works. ✅
+  We prefer `/work/code.rb` (no argv size limit).
+- **Result via `/work/out.json`**: works ✅ (guest writes the JSON envelope; host reads from the tmpdir).
+- **Result via stdout sentinel** (fallback): works ✅.
+- ⚠️ Known risk (recorded): malicious code *inside the guest* can forge the envelope
+  (e.g., `at_exit` overwriting `out.json`, or printing the sentinel). The channel is reliable against
+  accidents, not against an active adversary. Stage 2 mitigations: random token (ENV read and
+  erased by the prelude), schema validation on the host, sentinel count check.
 
-### Q5 — interrupção (epoch vs fuel) (RESOLVIDO)
+### Q5 — interruption (epoch vs fuel) (RESOLVED)
 
 - **Epoch (wall-clock)**: `Engine.new(epoch_interruption: true)` + `engine.start_epoch_interval(25)`
-  + `store.set_epoch_deadline(ticks)` → loop infinito morto em **508ms para timeout de 500ms**. ✅
-  - **Armadilha 3**: chamar `set_epoch_deadline` **antes** de `instantiate` fez o trap disparar
-    imediatamente (`:interrupt`). Regra: **setar o deadline logo antes do `invoke`** (é o padrão do
-    exemplo oficial `examples/epoch.rb`).
-- **Fuel**: `consume_fuel: true` + `store.set_fuel(n)` → `Wasmtime::Trap` com `code: :out_of_fuel`. ✅
-  - Taxa medida de loop puro (`while true; end`): **~8.4e9 fuel/s** (usar como base de calibração).
-  - Epoch e fuel coexistem no mesmo engine/store.
+  + `store.set_epoch_deadline(ticks)` → infinite loop killed in **508ms for a 500ms timeout**. ✅
+  - **Pitfall 3**: calling `set_epoch_deadline` **before** `instantiate` made the trap fire
+    immediately (`:interrupt`). Rule: **set the deadline right before the `invoke`** (that is the
+    pattern in the official `examples/epoch.rb`).
+- **Fuel**: `consume_fuel: true` + `store.set_fuel(n)` → `Wasmtime::Trap` with `code: :out_of_fuel`. ✅
+  - Measured rate of a pure loop (`while true; end`): **~8.4e9 fuel/s** (use as calibration baseline).
+  - Epoch and fuel coexist in the same engine/store.
 
-### Q6 — custo de spawn (MEDIDO)
+### Q6 — spawn cost (MEASURED)
 
-| Etapa | p50 |
+| Step | p50 |
 |---|---|
 | `Store.new` | 0.03 ms |
-| `instantiate` (módulo já compilado) | 0.18 ms |
-| `invoke("_start")` (boot do ruby) | ~240 ms |
-| `Module.from_file` (compilação fria, 1x) | ~15 s (!) |
+| `instantiate` (module already compiled) | 0.18 ms |
+| `invoke("_start")` (ruby boot) | ~240 ms |
+| `Module.from_file` (cold compilation, 1x) | ~15 s (!) |
 
-- Compilação fria do módulo de 110MB custa **~15s** → cache obrigatório de módulo compilado
+- Cold compilation of the 110MB module costs **~15s** → mandatory compiled module cache
   (`Module#serialize` / `deserialize_file`, Stage 2).
-- RSS do processo host: estável (~1.3GB após compilação; **sem crescimento** entre execuções com
+- Host process RSS: stable (~1.3GB after compilation; **no growth** between executions with
   `store.close`).
 
-### Q7 — isolamento (VALIDADO)
+### Q7 — isolation (VALIDATED)
 
-| Probe | Resultado |
+| Probe | Result |
 |---|---|
-| `File.write("/etc/passwd")` | `Errno::ENOENT` (guest não vê FS do host) |
-| `Dir["/*"]` | `[]` (root vazio para o guest) |
-| `system("ls")` | retorna `true` mas **não executa nada** (stub) |
+| `File.write("/etc/passwd")` | `Errno::ENOENT` (guest does not see the host FS) |
+| `Dir["/*"]` | `[]` (empty root for the guest) |
+| `system("ls")` | returns `true` but **executes nothing** (stub) |
 | backtick `` `ls` `` | `ArgumentError` |
 | `IO.popen` | `ArgumentError` |
 | `fork` | `NotImplementedError` |
-| `Thread.new` | `NotImplementedError` (wasip1 sem threads) |
-| `require "socket"` | `LoadError` (sem rede) |
-| `ENV` | `{}` (saneado via `set_env({})`) |
+| `Thread.new` | `NotImplementedError` (wasip1 without threads) |
+| `require "socket"` | `LoadError` (no network) |
+| `ENV` | `{}` (sanitized via `set_env({})`) |
 
-Conclusão: a superfície WASI já é mínima por padrão. O prelude de hardening (Stage 2) existirá para
-neutralizar os stubs enganosos (`system` retorna `true`!) e defesa em profundidade.
+Conclusion: the WASI surface is already minimal by default. The hardening prelude (Stage 2) will
+exist to neutralize the misleading stubs (`system` returns `true`!) and as defense in depth.
 
-### Q8 — memory limit (FUNCIONA, com nuance)
+### Q8 — memory limit (WORKS, with a nuance)
 
-- `Store.new(limits: { memory_size: 128MB })` + alocação infinita → o guest morre com
-  `[BUG] rb_darray_realloc...` (abort interno do ruby.wasm) → trap `:unreachable_code_reached`.
-- `store.linear_memory_limit_hit?` → `true` ✅ — usamos esse flag para mapear o trap como
-  `:memory_limit` de forma confiável.
+- `Store.new(limits: { memory_size: 128MB })` + infinite allocation → the guest dies with
+  `[BUG] rb_darray_realloc...` (internal ruby.wasm abort) → trap `:unreachable_code_reached`.
+- `store.linear_memory_limit_hit?` → `true` ✅ — we use this flag to map the trap to
+  `:memory_limit` reliably.
 
-### Q9 — concorrência (ACHADO CRÍTICO)
+### Q9 — concurrency (CRITICAL FINDING)
 
-- 4 threads rodando boots paralelos: wall = **soma dos tempos (ratio 1.05)** → execução **serial**.
-- Causa: `Instance#invoke` do wasmtime-rb passa `gvl: true` hardcoded para `Func::invoke` (o GVL é
-  mantido durante a execução do wasm). `instance.export("_start").to_func.call` também serializou
-  (mesmo comportamento).
-- Implicação: **um processo = um sandbox por vez**. Deadline de epoch continua funcionando (timer
-  nativo do engine), então um guest travado não trava o processo além do timeout — mas requisições
-  concorrentes serializam. Paralelismo real: múltiplos processos (Puma workers/sidekiq) por enquanto;
-  investigar Ractor em stage futura.
+- 4 threads running parallel boots: wall = **sum of the times (ratio 1.05)** → **serial** execution.
+- Cause: wasmtime-rb `Instance#invoke` passes `gvl: true` hardcoded to `Func::invoke` (the GVL is
+  kept during the wasm execution). `instance.export("_start").to_func.call` also serialized
+  (same behavior).
+- Implication: **one process = one sandbox at a time**. The epoch deadline keeps working (native
+  engine timer), so a stuck guest does not hang the process beyond the timeout — but concurrent
+  requests serialize. Real parallelism: multiple processes (Puma workers/sidekiq) for now;
+  investigate Ractor in a future stage.
 
-## 4. Implementação entregue
+## 4. Implementation delivered
 
 ```
 Gemfile                                  # wasmtime, ruby_wasm, rspec, rake
 Rakefile                                 # spec + rake security_box:build_image
 .rspec / .gitignore
-bin/spike.rb                             # spike Q1..Q9 (relatório no log acima)
-lib/security_box.rb                      # SecurityBox.eval (atalho) + requires
-lib/security_box/configuration.rb        # imutável (freeze) + #with
-lib/security_box/result.rb               # envelope de resultado
-lib/security_box/runtime.rb              # cache de Engine (timer de epoch) e Module compilado
-lib/security_box/sandbox.rb              # Store/Instance one-shot, WASI, limites, mapeamento de traps
+bin/spike.rb                             # spike Q1..Q9 (report in the log above)
+lib/security_box.rb                      # SecurityBox.eval (shortcut) + requires
+lib/security_box/configuration.rb        # immutable (freeze) + #with
+lib/security_box/result.rb               # result envelope
+lib/security_box/runtime.rb              # Engine cache (epoch timer) and compiled Module
+lib/security_box/sandbox.rb              # one-shot Store/Instance, WASI, limits, trap mapping
 lib/security_box/errors.rb               # Error, ImageMissing, InvalidConfiguration
-lib/security_box/guest/main.rb           # guest empacotado em /src/main.rb
-spec/spec_helper.rb                      # builda a imagem se faltar
-spec/security_box/configuration_spec.rb  # 5 exemplos
-spec/security_box/sandbox_spec.rb        # 16 exemplos (integração + matriz de isolamento)
+lib/security_box/guest/main.rb           # guest packed into /src/main.rb
+spec/spec_helper.rb                      # builds the image if missing
+spec/security_box/configuration_spec.rb  # 5 examples
+spec/security_box/sandbox_spec.rb        # 16 examples (integration + isolation matrix)
 ```
 
-### Números finais (nível lib, host Ruby 4.0.5)
+### Final numbers (lib level, host Ruby 4.0.5)
 
-| Métrica | Valor |
+| Metric | Value |
 |---|---|
-| `SecurityBox::Sandbox#eval` (p50, após warmup) | **257 ms** (dominado pelo boot do ruby.wasm: ~240ms) |
+| `SecurityBox::Sandbox#eval` (p50, after warmup) | **257 ms** (dominated by the ruby.wasm boot: ~240ms) |
 | `Store.new` + `instantiate` | ~0.2 ms |
-| `Module.from_file` (compilação fria, 1x por processo) | ~15 s |
-| RSS do processo host (15 evals) | estável em ~1.3GB, sem vazamento com `store.close` |
-| Interrupção epoch 500ms | 508–518 ms (precisão ~±20ms) |
-| Fuel de loop puro | ~8.4e9 fuel/s |
-| Suíte RSpec (21 exemplos) | **21/21 verde em ~21s** |
+| `Module.from_file` (cold compilation, 1x per process) | ~15 s |
+| Host process RSS (15 evals) | stable at ~1.3GB, no leak with `store.close` |
+| Epoch interruption 500ms | 508–518 ms (precision ~±20ms) |
+| Fuel of pure loop | ~8.4e9 fuel/s |
+| RSpec suite (21 examples) | **21/21 green in ~21s** |
 
-### Testes (matriz coberta)
+### Tests (covered matrix)
 
-Execução básica com valor/stdout; múltiplas execuções; serialização JSON e fallback `inspect`;
-exceção do usuário (`:error` + class/message); `SystemExit`; timeout por epoch; fuel;
-memory limit; truncamento de stdout; e isolamento: FS (`/etc/passwd`, `Dir["/*"]`),
-`system` (stub inofensivo), `fork`, `require "socket"`, `Thread.new`, `ENV` vazio.
+Basic execution with value/stdout; multiple executions; JSON serialization and `inspect` fallback;
+user exception (`:error` + class/message); `SystemExit`; epoch timeout; fuel;
+memory limit; stdout truncation; and isolation: FS (`/etc/passwd`, `Dir["/*"]`),
+`system` (harmless stub), `fork`, `require "socket"`, `Thread.new`, empty `ENV`.
 
-### Aprendizados de implementação (além do spike)
+### Implementation learnings (beyond the spike)
 
-- `NotImplementedError` e `LoadError` herdam de `ScriptError`, **não** de `StandardError` —
-  o guest precisa de `rescue Exception` para reportá-los no envelope (spec cobre).
-- Traps do wasmtime: `:interrupt` → timeout, `:out_of_fuel` → fuel, `:memory_out_of_bounds`/`linear_memory_limit_hit?`
-  → memory limit, demais → `:sandbox_error`.
-- `Wasmtime::WasiExit` acontece quando o guest sai sem envelope (ex.: `exit!`) → `:sandbox_error`.
-- O round-trip `JSON.parse(JSON.generate(value))` no guest normaliza símbolos/objetos não
-  serializáveis para o que o host efetivamente lerá.
-- `store.close` no `ensure` é essencial para estabilidade de memória.
+- `NotImplementedError` and `LoadError` inherit from `ScriptError`, **not** from `StandardError` —
+  the guest needs `rescue Exception` to report them in the envelope (spec covers it).
+- wasmtime traps: `:interrupt` → timeout, `:out_of_fuel` → fuel, `:memory_out_of_bounds`/`linear_memory_limit_hit?`
+  → memory limit, others → `:sandbox_error`.
+- `Wasmtime::WasiExit` happens when the guest exits without an envelope (e.g., `exit!`) → `:sandbox_error`.
+- The round-trip `JSON.parse(JSON.generate(value))` in the guest normalizes symbols/non-serializable
+  objects into what the host will actually read.
+- `store.close` in the `ensure` is essential for memory stability.
 
-## 5. Decisões tomadas nesta fase
+## 5. Decisions made in this phase
 
-1. **Entrega de código**: arquivo `/work/code.rb` via `set_mapped_directory` (argv como fallback).
-2. **Resultado**: `/work/out.json` (envelope JSON), com fallback de sentinela no stdout.
-3. **Interrupção**: epoch como limite de wall-clock (obrigatório) + fuel como orçamento determinístico
-   (opcional por config). Deadline sempre setado imediatamente antes do `invoke`.
-4. **Status do Result**: `:ok`, `:error` (erro do código do usuário), `:timeout`, `:fuel_exhausted`,
+1. **Code delivery**: file `/work/code.rb` via `set_mapped_directory` (argv as fallback).
+2. **Result**: `/work/out.json` (JSON envelope), with a stdout sentinel fallback.
+3. **Interruption**: epoch as the wall-clock limit (mandatory) + fuel as a deterministic budget
+   (optional per config). Deadline always set immediately before the `invoke`.
+4. **Result status**: `:ok`, `:error` (user code error), `:timeout`, `:fuel_exhausted`,
    `:memory_limit` (via `linear_memory_limit_hit?`), `:sandbox_error`.
-5. **Runtime compartilhado**: `Engine` + `Module` memoizados por config (mutex); `Module` compilado
-   1x por processo (~15s na primeira spawn — cache em disco entra na Stage 2).
-6. **Concorrência v1**: serial por processo; escala horizontal via processos. Documentado como
-   limitação, Ractor fica para stage futura.
+5. **Shared runtime**: `Engine` + `Module` memoized per config (mutex); `Module` compiled
+   once per process (~15s on the first spawn — disk cache lands in Stage 2).
+6. **v1 concurrency**: serial per process; horizontal scaling via processes. Documented as a
+   limitation; Ractor stays for a future stage.
 
-## 6. Pendências para a Stage 2
+## 6. Pending items for Stage 2
 
-- [ ] Cache da imagem `.wasm` e do módulo compilado em disco (`Module#serialize`/`deserialize_file`)
-      — elimina os ~15s de compilação fria a cada processo.
-- [ ] Channel de resultado com token (ENV apagado pelo prelude) + validação de schema no host.
-- [ ] Prelude de hardening: neutralizar `system`, backtick, `IO.popen`, `Kernel#open`, `ENV` após leitura.
-- [ ] `Configuration` completa (perfis nomeados, `#with`, fingerprint) — hoje só o núcleo.
-- [ ] Investigar: mínimo viável de `memory_size` para o boot do ruby.wasm (o default de 512MB é
-      conservador); taxas de fuel por tipo de workload.
-- [ ] Investigar: Ractor para paralelismo real (Engine é `frozen_shareable` no wasmtime-rb).
-- [ ] Benchmark: spawn com `InstanceAllocationStrategy::Pooling`.
+- [ ] Disk cache of the `.wasm` image and the compiled module (`Module#serialize`/`deserialize_file`)
+      — eliminates the ~15s of cold compilation on every process.
+- [ ] Result channel with token (ENV erased by the prelude) + schema validation on the host.
+- [ ] Hardening prelude: neutralize `system`, backtick, `IO.popen`, `Kernel#open`, `ENV` after reading.
+- [ ] Full `Configuration` (named profiles, `#with`, fingerprint) — today only the core.
+- [ ] Investigate: minimum viable `memory_size` for the ruby.wasm boot (the 512MB default is
+      conservative); fuel rates per workload type.
+- [ ] Investigate: Ractor for real parallelism (Engine is `frozen_shareable` in wasmtime-rb).
+- [ ] Benchmark: spawn with `InstanceAllocationStrategy::Pooling`.
