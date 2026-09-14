@@ -50,6 +50,11 @@ end
 # packaging (`rake build`/`rake release`).
 task build: "security_box:build_image"
 
+# Hard guard for releases: never publish a gem with a missing or stale image.
+# (`release` already depends on build -> build_image; this fails fast and
+# explicitly if the image is ever out of sync with the guest sources.)
+task release: "security_box:verify_image"
+
 task default: :spec
 
 def image_fresh?
