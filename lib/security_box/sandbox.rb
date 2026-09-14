@@ -10,12 +10,17 @@ module SecurityBox
   # Flow:
   #   1. exclusive tmpdir mounted as /work (read-write)
   #   2. user code written to /work/code.rb
-  #   3. guest (/src/main.rb) evaluates it and writes /work/out.json
-  #   4. host reads the envelope and returns a Result
+  #   3. a per-eval random token is passed via ENV (SB_TOKEN); the guest
+  #      prelude captures it and scrubs ENV before user code runs
+  #   4. guest (/src/main.rb) evaluates the code and writes /work/out.json,
+  #      embedding the token (stdout sentinel fallback does the same)
+  #   5. host reads the envelope, validates schema + token (untrusted results
+  #      become a sandbox failure) and returns a Result
   class Sandbox
     GUEST_ENTRYPOINT = "/src/main.rb"
     RESULT_FILE = "out.json"
     CODE_FILE = "code.rb"
+    TOKEN_ENV_VAR = "SB_TOKEN"
 
     def initialize(configuration = Configuration.build)
       @config = configuration
@@ -32,6 +37,7 @@ module SecurityBox
       config = overrides.empty? ? @config : @config.with(**overrides)
       stdout = +""
       stderr = +""
+      token = SecureRandom.hex(16)
       t0 = monotonic_ms
 
       Dir.mktmpdir("security_box") do |workdir|
@@ -42,7 +48,7 @@ module SecurityBox
 
         store = Wasmtime::Store.new(
           @engine,
-          wasi_p1_config: build_wasi(workdir, stdout, stderr, config),
+          wasi_p1_config: build_wasi(workdir, stdout, stderr, config, token),
           limits: { memory_size: config.memory_size }
         )
         begin
@@ -51,7 +57,7 @@ module SecurityBox
           store.set_epoch_deadline(epoch_ticks(config))
           status = invoke_guest(instance, store)
           fuel_used = config.fuel - store.get_fuel
-          envelope = read_envelope(workdir)
+          envelope = read_envelope(workdir, stdout, token)
         ensure
           store.close
         end
@@ -62,13 +68,13 @@ module SecurityBox
 
     private
 
-    def build_wasi(workdir, stdout, stderr, config)
+    def build_wasi(workdir, stdout, stderr, config, token)
       Wasmtime::WasiConfig.new
         .set_stdin_string("")
         .set_stdout_buffer(stdout, config.stdout_limit)
         .set_stderr_buffer(stderr, config.stderr_limit)
         .set_argv(["ruby", GUEST_ENTRYPOINT])
-        .set_env(config.env)
+        .set_env(config.env.merge(TOKEN_ENV_VAR => token))
         .set_mapped_directory(workdir, "/work", :read_write)
     end
 
@@ -110,12 +116,16 @@ module SecurityBox
       end
     end
 
-    def read_envelope(workdir)
-      path = File.join(workdir, RESULT_FILE)
-      return nil unless File.exist?(path)
+    def read_envelope(workdir, stdout, token)
+      # Preferred channel: /work/out.json. Fallback: sentinel line on stdout.
+      # Both go through the same strict validation (schema + token).
+      Envelope.parse(read_result_file(workdir), token) ||
+        Envelope.from_stdout(stdout, token)
+    end
 
-      JSON.parse(File.read(path))
-    rescue JSON::ParserError
+    def read_result_file(workdir)
+      File.read(File.join(workdir, RESULT_FILE))
+    rescue SystemCallError
       nil
     end
 

@@ -16,13 +16,16 @@ tries to escape.
 ## How it works
 
 1. A `ruby.wasm` image is packed with the Ruby runtime + stdlib + a small guest
-   entrypoint (`lib/security_box/guest/main.rb`).
+   entrypoint (`lib/security_box/guest/main.rb`) plus a hardening prelude
+   (`lib/security_box/guest/prelude.rb`).
 2. On every `#eval`, the host creates an exclusive tmpdir, writes the user code to it, and
-   mounts it read-write as `/work` inside the sandbox.
-3. A fresh wasm instance boots, evaluates the code and serializes a JSON envelope to
-   `/work/out.json`.
-4. The host reads the envelope, maps any wasmtime trap to a `Result` status, closes the
-   store and discards the tmpdir.
+   mounts it read-write as `/work` inside the sandbox. It also generates a per-eval
+   random token and passes it to the guest via `SB_TOKEN`.
+3. A fresh wasm instance boots; the prelude captures the token, scrubs `ENV` and
+   neutralizes process-spawn APIs, then the guest evaluates the code and serializes a
+   token-signed JSON envelope to `/work/out.json` (stdout sentinel fallback).
+4. The host validates the envelope (schema + token — forged results are rejected),
+   maps any wasmtime trap to a `Result` status, closes the store and discards the tmpdir.
 
 One wasm process per `#eval` means zero residual state between executions.
 
@@ -87,15 +90,18 @@ result.duration_ms # => 257.0 (approx; dominated by the ruby.wasm boot)
 
 ### Warming up
 
-The first `eval` in a process pays the cold WebAssembly compilation of the image
-(~15s) plus the engine setup. Call `SecurityBox.warmup` ahead of time (e.g., at
-boot) to pay that cost up front — every subsequent `eval` then only pays the
-~240ms guest boot:
+The first `eval` in a process pays either the cold WebAssembly compilation of the image
+(~15s) or a fast deserialize from the compiled-module disk cache (~0.5s) plus the engine
+setup. The cache lives in `~/.cache/security_box/modules` (override with
+`SECURITY_BOX_CACHE_DIR`), is keyed by the image content, and is fully best effort —
+on any miss or corruption the module is simply recompiled. Call `SecurityBox.warmup`
+ahead of time (e.g., at boot) to pay that cost up front — every subsequent `eval` then
+only pays the ~260ms guest boot:
 
 ```ruby
 SecurityBox.warmup
 
-SecurityBox.eval("40 + 2").value # => 42 (~250ms, no cold compile)
+SecurityBox.eval("40 + 2").value # => 42 (~260ms, no cold compile)
 ```
 
 `#eval` warms the same caches lazily on first use, so calling `warmup` is a pure
@@ -184,11 +190,13 @@ string.
 |---|---|
 | `File.write("/etc/passwd", ...)` | `Errno::ENOENT` (guest does not see the host FS) |
 | `Dir["/*"]` | `[]` (empty root) |
-| `system("ls")` / backticks / `IO.popen` | no-op stubs / `ArgumentError` (nothing executes) |
+| `system("ls")` / backticks / `IO.popen` / `Process.spawn` | `SecurityError` (hardening prelude) |
+| `Kernel#open(...)` | `SecurityError` (pipe form; use `File.open`) |
 | `fork` | `NotImplementedError` |
 | `Thread.new` | `NotImplementedError` (WASI p1 has no threads) |
 | `require "socket"` | `LoadError` (no network) |
-| `ENV` | `{}` (sanitized) |
+| `ENV` | `{}` (token read and scrubbed by the prelude) |
+| forge `out.json` via `at_exit` / fake sentinel | rejected (token mismatch → `:sandbox_error`) |
 | infinite loop | killed by epoch deadline or fuel budget |
 
 Notes:
@@ -230,3 +238,5 @@ bundle exec ruby bin/spike.rb
 
 - `docs/PLAN.md` — architecture, roadmap and threat model
 - `docs/plan/stages/stage_1.md` — stage 1 findings and measured numbers
+- `docs/plan/stages/stage_2.md` — stage 2 findings (hardening prelude, result-channel
+  integrity, compiled-module disk cache)

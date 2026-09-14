@@ -2,13 +2,16 @@
 
 require "wasmtime"
 
+require_relative "module_cache"
+
 module SecurityBox
   # Registry of heavyweight artifacts shared across sandboxes:
   # - Engine (one per runtime configuration; owns the epoch timer)
   # - Compiled Module (one per engine+image)
   #
-  # Module compilation is slow (~15s the first time per process); the disk cache
-  # (Module#serialize) lands in Stage 2.
+  # Module compilation is slow (~15s the first time per process); the compiled
+  # artifact is persisted via ModuleCache so later processes deserialize it
+  # from disk instead of recompiling.
   module Runtime
     MUTEX = Mutex.new
 
@@ -24,8 +27,10 @@ module SecurityBox
 
       def module_for(engine, image_path)
         MUTEX.synchronize do
-          @modules[[engine.object_id, image_path]] ||=
-            Wasmtime::Module.from_file(engine, image_path)
+          @modules[[engine.object_id, image_path]] ||= begin
+            ModuleCache.load_module(engine, image_path) ||
+              ModuleCache.compile_and_store(engine, image_path)
+          end
         end
       end
 

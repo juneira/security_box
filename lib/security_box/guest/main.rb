@@ -3,10 +3,15 @@
 # Input: /work/code.rb (preferred) or ARGV[0].
 # Result: /work/out.json (JSON envelope); fallback: sentinel line on stdout.
 #
-# NOTE (stage 1): the result channel is reliable against accidents, not against
-# an active adversary (guest code can forge the envelope). Token mitigations and
-# schema validation land in Stage 2.
+# Integrity: the host generates a per-eval random token and passes it via ENV;
+# the prelude captures it and scrubs ENV before user code runs. Both the
+# envelope and the sentinel line embed the token, and the host rejects any
+# result that does not carry the expected token (see lib/security_box/envelope.rb).
+# This hardens the channel against forged results (e.g. an at_exit handler
+# overwriting out.json); it is defense in depth, not a cryptographic guarantee.
 require "json"
+
+require_relative "prelude"
 
 module SB
   SENTINEL = "__SECURITY_BOX_RESULT__"
@@ -15,13 +20,15 @@ module SB
   module_function
 
   def run
+    token = SBPrelude.apply!
+
     code = fetch_code
-    return fatal("no code provided") unless code
+    return fatal("no code provided", token) unless code
 
     t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     out = evaluate(code)
     out[:duration_ms] = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(2)
-    emit(out)
+    emit(out, token)
   end
 
   def fetch_code
@@ -47,15 +54,16 @@ module SB
   end
 
   # Preferred: /work/out.json. Fallback (no /work): sentinel on stdout.
-  def emit(out)
-    json = JSON.generate(out)
+  # Both carry the sandbox token so the host can reject forged results.
+  def emit(out, token)
+    json = JSON.generate(out.merge(token: token))
     File.write(File.join(WORK_DIR, "out.json"), json)
   rescue StandardError, SystemCallError
-    $stdout.puts "#{SENTINEL}:#{json}"
+    $stdout.puts "#{SENTINEL}:#{token}:#{json}"
   end
 
-  def fatal(message)
-    emit({ ok: false, value: nil, error: { "class" => "SecurityBox::Guest", "message" => message } })
+  def fatal(message, token)
+    emit({ ok: false, value: nil, error: { "class" => "SecurityBox::Guest", "message" => message } }, token)
   end
 end
 

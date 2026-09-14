@@ -116,10 +116,11 @@ RSpec.describe "sandbox isolation" do
     expect(result.value).to be(true)
   end
 
-  it "does not execute processes (system is a no-op stub)" do
-    sandbox.eval("system('touch /tmp/security_box_pwned')")
+  it "does not execute processes (system raises SecurityError)" do
+    result = sandbox.eval("system('touch /tmp/security_box_pwned')")
 
-    # system returns true on wasip1, but nothing runs — the file must not exist
+    expect(result.status).to eq(:error)
+    expect(result.error["class"]).to eq("SecurityError")
     expect(File.exist?("/tmp/security_box_pwned")).to be(false)
   end
 
@@ -145,5 +146,104 @@ RSpec.describe "sandbox isolation" do
     result = sandbox.eval("ENV.to_h")
 
     expect(result.value).to eq({})
+  end
+end
+
+RSpec.describe "sandbox hardening prelude" do
+  subject(:sandbox) { SecurityBox::Sandbox.new }
+
+  around do |example|
+    Timeout.timeout(30) { example.run }
+  end
+
+  it "raises SecurityError for backticks" do
+    result = sandbox.eval("`ls`")
+
+    expect(result.status).to eq(:error)
+    expect(result.error["class"]).to eq("SecurityError")
+  end
+
+  it "raises SecurityError for %x" do
+    result = sandbox.eval("%x(ls)")
+
+    expect(result.status).to eq(:error)
+    expect(result.error["class"]).to eq("SecurityError")
+  end
+
+  it "raises SecurityError for IO.popen" do
+    result = sandbox.eval("IO.popen('ls')")
+
+    expect(result.status).to eq(:error)
+    expect(result.error["class"]).to eq("SecurityError")
+  end
+
+  it "raises SecurityError for Process.spawn" do
+    result = sandbox.eval("Process.spawn('ls')")
+
+    expect(result.status).to eq(:error)
+    expect(result.error["class"]).to eq("SecurityError")
+  end
+
+  it "raises SecurityError for Kernel#open (pipe form included)" do
+    result = sandbox.eval("open('|ls')")
+
+    expect(result.status).to eq(:error)
+    expect(result.error["class"]).to eq("SecurityError")
+  end
+
+  it "still allows plain file APIs after neutralizing Kernel#open" do
+    result = sandbox.eval("File.write('/work/plain.txt', 'ok'); File.read('/work/plain.txt')")
+
+    expect(result).to be_ok
+    expect(result.value).to eq("ok")
+  end
+
+  it "does not leak the sandbox token via ENV" do
+    result = sandbox.eval("[ENV['SB_TOKEN'], ENV.keys]")
+
+    expect(result).to be_ok
+    expect(result.value).to eq([nil, []])
+  end
+end
+
+RSpec.describe "result channel integrity" do
+  subject(:sandbox) { SecurityBox::Sandbox.new }
+
+  around do |example|
+    Timeout.timeout(30) { example.run }
+  end
+
+  it "rejects an at_exit envelope overwrite without the token" do
+    result = sandbox.eval(
+      'at_exit { File.write("/work/out.json", %q({"ok":true,"value":"hacked"})) }; 21 * 2'
+    )
+
+    expect(result.status).to eq(:sandbox_error)
+    expect(result.value).to be_nil
+  end
+
+  it "rejects an at_exit overwrite carrying a guessed token" do
+    result = sandbox.eval(
+      'at_exit { File.write("/work/out.json", ' \
+      '%q({"ok":true,"value":"hacked","token":"00000000000000000000000000000000"})) }; 21 * 2'
+    )
+
+    expect(result.status).to eq(:sandbox_error)
+  end
+
+  it "ignores a forged stdout sentinel when the envelope is valid" do
+    result = sandbox.eval(
+      'puts "__SECURITY_BOX_RESULT__:deadbeef:{\\"ok\\":true}"; 42'
+    )
+
+    expect(result.status).to eq(:ok)
+    expect(result.value).to eq(42)
+  end
+
+  it "still delivers values from the trusted envelope" do
+    result = sandbox.eval('{ "sum" => 21 * 2 }')
+
+    expect(result).to be_ok
+    expect(result.value).to eq({ "sum" => 42 })
   end
 end

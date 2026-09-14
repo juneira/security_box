@@ -4,7 +4,9 @@ require_relative "security_box/version"
 require_relative "security_box/errors"
 require_relative "security_box/configuration"
 require_relative "security_box/result"
+require_relative "security_box/module_cache"
 require_relative "security_box/runtime"
+require_relative "security_box/envelope"
 require_relative "security_box/sandbox"
 
 module SecurityBox
