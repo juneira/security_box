@@ -56,8 +56,13 @@ module SecurityBox
           instance = build_linker.instantiate(store, @module)
           store.set_epoch_deadline(epoch_ticks(config))
           status = invoke_guest(instance, store)
-          fuel_used = config.fuel - store.get_fuel
+          fuel_used = config.fuel - store.get_fuel unless status == :timeout
           envelope = read_envelope(workdir, stdout, token)
+        rescue Wasmtime::Error => e
+          # Instantiation can fail before the guest ever runs (e.g. a
+          # memory_size below the module's declared minimum pages).
+          status = :sandbox_error
+          stderr << "security_box: #{e.class}: #{e.message}\n"
         ensure
           store.close
         end
@@ -145,6 +150,15 @@ module SecurityBox
           fuel_used: fuel_used, duration_ms: duration_ms,
           guest_duration_ms: envelope["duration_ms"]
         )
+      elsif guest_memory_error?(guest_error)
+        # The guest hit the store memory limit through the Ruby interpreter
+        # (NoMemoryError instead of a wasm trap) — report it as a limit, not
+        # a user error.
+        Result.new(
+          status: :memory_limit, error: guest_error, stdout: stdout, stderr: stderr,
+          fuel_used: fuel_used, duration_ms: duration_ms,
+          guest_duration_ms: envelope["duration_ms"]
+        )
       else
         Result.new(
           status: :error, error: guest_error, stdout: stdout, stderr: stderr,
@@ -152,6 +166,10 @@ module SecurityBox
           guest_duration_ms: envelope["duration_ms"]
         )
       end
+    end
+
+    def guest_memory_error?(guest_error)
+      guest_error.is_a?(Hash) && guest_error["class"] == "NoMemoryError"
     end
 
     def monotonic_ms

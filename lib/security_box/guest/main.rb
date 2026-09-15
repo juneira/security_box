@@ -43,7 +43,26 @@ module SB
   def evaluate(code)
     { ok: true, value: jsonable(eval(code, TOPLEVEL_BINDING, "sandbox")) } # rubocop:disable Security/Eval,Style/EvalWithLocation
   rescue Exception => e # rubocop:disable Lint/RescueException
-    { ok: false, value: nil, error: { "class" => e.class.name, "message" => e.message.to_s } }
+    {
+      ok: false, value: nil,
+      error: {
+        "class" => e.class.name,
+        "message" => e.message.to_s,
+        "backtrace" => guest_backtrace(e)
+      }
+    }
+  end
+
+  # Frames of the user code only: guest protocol internals (main.rb /
+  # prelude.rb) are stripped and the list is capped so a deep recursion
+  # cannot flood the result channel.
+  def guest_backtrace(exception)
+    frames = (exception.backtrace || []).reject do |frame|
+      frame.include?("main.rb") || frame.include?("prelude.rb")
+    end
+    frames.first(20)
+  rescue StandardError
+    []
   end
 
   # Values must survive JSON; the round-trip normalizes what the host will read.
@@ -55,11 +74,22 @@ module SB
 
   # Preferred: /work/out.json. Fallback (no /work): sentinel on stdout.
   # Both carry the sandbox token so the host can reject forged results.
+  # The write is verified by reading it back — a silent truncation or
+  # partial write falls through to the sentinel instead of losing the
+  # result.
   def emit(out, token)
     json = JSON.generate(out.merge(token: token))
-    File.write(File.join(WORK_DIR, "out.json"), json)
+    unless write_verified(json)
+      $stdout.puts "#{SENTINEL}:#{token}:#{json}"
+    end
+  end
+
+  def write_verified(json)
+    path = File.join(WORK_DIR, "out.json")
+    File.write(path, json)
+    File.read(path) == json
   rescue StandardError, SystemCallError
-    $stdout.puts "#{SENTINEL}:#{token}:#{json}"
+    false
   end
 
   def fatal(message, token)

@@ -144,12 +144,43 @@ SecurityBox.eval('1000.times { print "x" * 1000 }', stdout_limit: 4096).stdout.b
 Exceptions raised by guest code are a *result*, not a sandbox failure:
 
 ```ruby
-result = SecurityBox.eval('raise ArgumentError, "boom"')
+result = SecurityBox.eval("def boom; raise ArgumentError, 'boom'; end; boom")
 
-result.status           # => :error
-result.error["class"]   # => "ArgumentError"
-result.error["message"] # => "boom"
+result.status                    # => :error
+result.error["class"]            # => "ArgumentError"
+result.error["message"]          # => "boom"
+result.error["backtrace"]        # => ["sandbox:1:in 'Object#boom'", "sandbox:1:in '<main>'"]
 ```
+
+The backtrace contains guest frames only (sandbox-internal locations, capped at
+20 frames) — nothing from the host filesystem leaks.
+
+### Named profiles
+
+Reusable configurations registered once and spawned as often as needed:
+
+```ruby
+SecurityBox.register(:default) do |c|
+  c.fuel 10_000_000_000
+  c.timeout_ms 2_000
+end
+
+SecurityBox.register(:lean, from: :default) do |c|
+  c.fuel 2_000_000_000        # boot alone costs ~1e9; see the fuel notes below
+  c.timeout_ms 500
+end
+
+box = SecurityBox.spawn(:lean)               # Sandbox from the profile
+box.eval("40 + 2").value                     # => 42
+
+SecurityBox.spawn(:lean, timeout_ms: 100)    # per-call override (profile unchanged)
+SecurityBox.spawn                            # default configuration
+```
+
+Profiles are immutable: duplicate names and unknown names raise
+`SecurityBox::InvalidConfiguration`; overrides never mutate the profile.
+`SecurityBox::Configuration#fingerprint` gives every configuration a stable
+identity (equal settings → equal fingerprint), used to share runtime artifacts.
 
 ### Configuration
 
@@ -175,11 +206,11 @@ sandbox = SecurityBox::Sandbox.new(lean)
 | Status | Meaning |
 |---|---|
 | `:ok` | guest code ran and returned a value |
-| `:error` | guest code raised an exception (see `#error`) |
-| `:timeout` | interrupted by the epoch deadline (wall clock) |
+| `:error` | guest code raised an exception (see `#error`; includes `backtrace`) |
+| `:timeout` | interrupted by the epoch deadline (wall clock); `fuel_used` is `nil` (epoch traps restore fuel to the checkpoint) |
 | `:fuel_exhausted` | CPU budget exhausted |
-| `:memory_limit` | exceeded the store `memory_size` |
-| `:sandbox_error` | sandbox failure (unexpected trap, missing/invalid envelope) |
+| `:memory_limit` | exceeded the store `memory_size` (wasm trap or guest `NoMemoryError`) |
+| `:sandbox_error` | sandbox failure (unexpected trap, missing/invalid envelope, `memory_size` below the image's minimum) |
 
 Values are JSON-serialized; non-serializable objects are returned as their `inspect`
 string.
@@ -205,6 +236,17 @@ Notes:
 - Concurrency: `invoke` holds the GVL, so executions serialize per host process. Scale
   horizontally with multiple processes (e.g., Puma workers); a stuck guest still can't
   hang the process thanks to the epoch deadline.
+- Ractor note: wasmtime `Engine`/`Module` are Ractor-shareable and Ractors run wasm in
+  parallel (measured ≈3.6x with 4 Ractors on 6 cores); a supported Ractor pool is on
+  the roadmap (see `docs/plan/stages/stage_3.md`).
+- Memory: the packed image declares a 1528-page (~95.5 MiB) minimum; `memory_size`
+  below that fails instantiation (reported as `:sandbox_error`). Practical minimum is
+  ~128–144MB for small workloads; the 512MB default leaves comfortable headroom.
+- Fuel budgeting: compute workloads burn ~4–8e9 fuel/s (tight loops up to ~8.4e9/s)
+  and every eval costs ~1e9 fuel for boot — see the calibration table in
+  `docs/plan/stages/stage_3.md`. Consequently `fuel` below ~1e9 cannot even boot, and
+  `timeout_ms` below ~300ms times out during the guest boot (~500ms is a practical
+  floor).
 
 ## Running the tests
 
@@ -240,3 +282,5 @@ bundle exec ruby bin/spike.rb
 - `docs/plan/stages/stage_1.md` — stage 1 findings and measured numbers
 - `docs/plan/stages/stage_2.md` — stage 2 findings (hardening prelude, result-channel
   integrity, compiled-module disk cache)
+- `docs/plan/stages/stage_3.md` — stage 3 findings (named profiles, Ractor
+  parallelism, memory floor, fuel calibration, backtrace)

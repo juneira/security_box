@@ -3,6 +3,7 @@
 require_relative "security_box/version"
 require_relative "security_box/errors"
 require_relative "security_box/configuration"
+require_relative "security_box/registry"
 require_relative "security_box/result"
 require_relative "security_box/module_cache"
 require_relative "security_box/runtime"
@@ -15,6 +16,33 @@ module SecurityBox
   #   SecurityBox.eval("1", fuel: 100)     # per-call overrides
   def self.eval(code, **overrides)
     Sandbox.new.eval(code, **overrides)
+  end
+
+  # Registers a named, reusable profile (see Registry).
+  #   SecurityBox.register(:lean, from: :default) { |c| c.fuel 5_000_000 }
+  def self.register(name, from: nil, &block)
+    Registry.register(name, from: from, &block)
+  end
+
+  # Builds a Sandbox from a registered profile, a Configuration, or the
+  # defaults:
+  #   SecurityBox.spawn(:lean)                  # named profile
+  #   SecurityBox.spawn(:lean, fuel: 1_000)     # profile + per-call overrides
+  #   SecurityBox.spawn(my_config)              # explicit configuration
+  #   SecurityBox.spawn                         # default configuration
+  def self.spawn(profile = nil, **overrides)
+    config = case profile
+             when nil then Configuration.build(**overrides)
+             when Symbol, String
+               resolved = Registry.resolve(profile)
+               overrides.empty? ? resolved : resolved.with(**overrides)
+             when Configuration
+               overrides.empty? ? profile : profile.with(**overrides)
+             else
+               raise ArgumentError,
+                     "profile must be a registered name or a Configuration, got #{profile.class}"
+             end
+    Sandbox.new(config)
   end
 
   # Prepares the shared runtime artifacts (Engine + compiled Module) ahead of

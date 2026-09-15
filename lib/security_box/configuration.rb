@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+require "digest"
+require "json"
+
 module SecurityBox
   # Immutable sandbox configuration. Use .build to create and #with to derive.
   class Configuration
@@ -53,6 +56,64 @@ module SecurityBox
         epoch_interval_ms: @epoch_interval_ms,
         env: @env
       }
+    end
+
+    # Stable identity of the configuration values (SHA-256 of the normalized
+    # hash). Two configurations with equal settings — regardless of how they
+    # were built — share the same fingerprint; any #with change produces a
+    # different one. Used to key profiles and, later, cached artifacts.
+    def fingerprint
+      Digest::SHA256.hexdigest(JSON.generate(canonical))
+    end
+
+    def canonical
+      to_h.merge(env: @env.sort.to_h)
+    end
+
+    # Mutable collector for the register DSL. Setter names match the
+    # Configuration options (no `=`, e.g. `c.fuel 100`); only changed values
+    # are collected and merged over the base profile.
+    class Builder
+      def initialize
+        @changes = {}
+      end
+
+      def changes
+        @changes
+      end
+
+      def image_path(value)
+        @changes[:image_path] = value
+      end
+
+      def fuel(value)
+        @changes[:fuel] = value
+      end
+
+      def timeout_ms(value)
+        @changes[:timeout_ms] = value
+      end
+
+      def memory_size(value)
+        @changes[:memory_size] = value
+      end
+
+      def stdout_limit(value)
+        @changes[:stdout_limit] = value
+      end
+
+      def stderr_limit(value)
+        @changes[:stderr_limit] = value
+      end
+
+      def epoch_interval_ms(value)
+        @changes[:epoch_interval_ms] = value
+      end
+
+      # Replaces the guest environment (it is not merged with the base).
+      def env(value)
+        @changes[:env] = value
+      end
     end
 
     private

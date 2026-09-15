@@ -55,10 +55,19 @@ module SecurityBox
           return false unless error.is_a?(Hash)
           return false unless error["class"].is_a?(String)
           return false unless error["message"].is_a?(String)
+          return false unless valid_backtrace?(error["backtrace"])
         end
 
         duration = envelope["duration_ms"]
         duration.nil? || duration.is_a?(Numeric)
+      end
+
+      # Optional: an array of backtrace frame strings (guest-side errors).
+      def valid_backtrace?(backtrace)
+        return true if backtrace.nil?
+        return false unless backtrace.is_a?(Array)
+
+        backtrace.all?(String)
       end
     end
   end

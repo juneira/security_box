@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-14
+
+### Added
+
+- Named, reusable profiles: `SecurityBox.register(:name, from: :base) { |c| c.fuel 100 }`
+  and `SecurityBox.spawn(:name, **overrides)` (a `Configuration` or the defaults also
+  work). Profiles are immutable; duplicate/unknown names raise
+  `SecurityBox::InvalidConfiguration`.
+- `SecurityBox::Configuration#fingerprint`: a stable identity for equal settings
+  (SHA-256 of the canonical configuration), ready for artifact caches.
+- Guest error envelopes now carry a `backtrace`: user frames only, capped at 20,
+  sandbox-internal locations (no host paths). Surfaced via `Result#error["backtrace"]`;
+  malformed backtraces invalidate the envelope (`:sandbox_error`).
+- `Result#fuel_used` is now `nil` for `:timeout`: epoch traps restore fuel to the last
+  checkpoint, so the restored value understated consumption by orders of magnitude.
+  (Truthful on completion, fuel exhaustion and memory-limit traps.)
+
+### Changed
+
+- A guest `NoMemoryError` (interpreter OOM against the store limit) is reported as
+  `:memory_limit` instead of `:error`.
+- A `memory_size` below the image's declared minimum (1528 pages ≈ 95.5 MiB) now
+  returns a `:sandbox_error` Result with a `security_box:` note on stderr instead of
+  raising `Wasmtime::Error` out of `#eval`.
+- The sandbox image must be repacked (`rake security_box:build_image`) when
+  upgrading: the guest entrypoint protocol changed.
+
 ## [0.2.0] - 2026-09-14
 
 ### Added

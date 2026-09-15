@@ -35,6 +35,35 @@ RSpec.describe SecurityBox::Configuration do
     end
   end
 
+  describe "#fingerprint" do
+    it "is equal for identically configured objects" do
+      a = described_class.build(fuel: 100, env: { "LANG" => "C" })
+      b = described_class.build(fuel: 100, env: { "LANG" => "C" })
+
+      expect(a.fingerprint).to eq(b.fingerprint)
+    end
+
+    it "changes when a value changes" do
+      base = described_class.build(fuel: 100)
+
+      expect(base.with(fuel: 200).fingerprint).not_to eq(base.fingerprint)
+      expect(base.with(timeout_ms: 200).fingerprint).not_to eq(base.fingerprint)
+    end
+
+    it "is insensitive to env key order" do
+      a = described_class.build(env: { "A" => "1", "B" => "2" })
+      b = described_class.build(env: { "B" => "2", "A" => "1" })
+
+      expect(a.fingerprint).to eq(b.fingerprint)
+    end
+
+    it "is stable across repeated calls" do
+      config = described_class.build
+
+      expect(config.fingerprint).to eq(config.fingerprint)
+    end
+  end
+
   describe "default image resolution" do
     around do |example|
       previous = ENV[described_class::IMAGE_ENV_VAR]

@@ -76,6 +76,37 @@ RSpec.describe SecurityBox::Envelope do
       expect(envelope.parse(raw, token)).to be_nil
     end
 
+    it "accepts ok:false with a valid backtrace array" do
+      raw = JSON.generate(valid_error_envelope.merge(
+        "error" => { "class" => "ArgumentError", "message" => "boom",
+                     "backtrace" => ["sandbox:1:in 'Object#boom'", "sandbox:1:in '<main>'"] }
+      ))
+
+      expect(envelope.parse(raw, token)).not_to be_nil
+    end
+
+    it "accepts ok:false without a backtrace (backwards compatibility)" do
+      expect(envelope.parse(JSON.generate(valid_error_envelope), token)).not_to be_nil
+    end
+
+    it "rejects ok:false with a backtrace containing non-strings" do
+      raw = JSON.generate(valid_error_envelope.merge(
+        "error" => { "class" => "ArgumentError", "message" => "boom",
+                     "backtrace" => ["sandbox:1", 42] }
+      ))
+
+      expect(envelope.parse(raw, token)).to be_nil
+    end
+
+    it "rejects ok:false with a non-array backtrace" do
+      raw = JSON.generate(valid_error_envelope.merge(
+        "error" => { "class" => "ArgumentError", "message" => "boom",
+                     "backtrace" => "sandbox:1:in 'Object#boom'" }
+      ))
+
+      expect(envelope.parse(raw, token)).to be_nil
+    end
+
     it "rejects a non-numeric duration_ms" do
       raw = JSON.generate(valid_ok_envelope.merge("duration_ms" => "soon"))
 
