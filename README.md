@@ -378,6 +378,13 @@ prints a timing report:
 bundle exec ruby bin/spike.rb
 ```
 
+## Samples
+
+- [`samples/ruby_llm/reader_agent`](samples/ruby_llm/reader_agent/README.md) — an
+  LLM agent built with [RubyLLM](https://github.com/crmne/ruby_llm) whose code-execution
+  tool runs model-generated Ruby inside the sandbox, demonstrating folder mounts
+  (read-only vs read-write) end to end.
+
 ## Documentation
 
 - `docs/PLAN.md` — architecture, roadmap and threat model
