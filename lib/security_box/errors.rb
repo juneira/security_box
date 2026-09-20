@@ -6,4 +6,6 @@ module SecurityBox
   class ImageMissing < Error; end
 
   class InvalidConfiguration < Error; end
+
+  class PoolClosed < Error; end
 end

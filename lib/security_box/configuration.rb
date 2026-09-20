@@ -13,6 +13,7 @@ module SecurityBox
     DEFAULTS = {
       image_path: nil, # resolved dynamically (project's build/security_box.wasm)
       fuel: 10_000_000_000,
+      fuel_ms: nil, # rate-based fuel ergonomics (see FUEL_PER_MS); nil = use :fuel
       timeout_ms: 2_000,
       memory_size: 512 * 1024 * 1024,
       stdout_limit: 1 << 20,
@@ -21,17 +22,25 @@ module SecurityBox
       env: {}.freeze
     }.freeze
 
-    attr_reader :image_path, :fuel, :timeout_ms, :memory_size,
+    # Fuel-per-ms conversion for #fuel_ms, from the stage-3 calibration table
+    # (docs/plan/stages/stage_3.md): compute workloads burn 3.2e9–8.4e9 fuel/s;
+    # 4e9/s is the conservative floor. The guest boot baseline (~9.1e8 fuel)
+    # is added on top so the budget covers boot even for trivial evals.
+    FUEL_PER_MS = 4_000_000
+    BOOT_FUEL_ALLOWANCE = 1_000_000_000
+
+    attr_reader :image_path, :fuel, :fuel_ms, :timeout_ms, :memory_size,
                 :stdout_limit, :stderr_limit, :epoch_interval_ms, :env
 
     def self.build(**options)
       new(**DEFAULTS.merge(options)).freeze
     end
 
-    def initialize(image_path: nil, fuel:, timeout_ms:, memory_size:,
+    def initialize(image_path: nil, fuel:, fuel_ms:, timeout_ms:, memory_size:,
                    stdout_limit:, stderr_limit:, epoch_interval_ms:, env:)
       @image_path = image_path || default_image_path
       @fuel = Integer(fuel)
+      @fuel_ms = fuel_ms.nil? ? nil : Integer(fuel_ms)
       @timeout_ms = Integer(timeout_ms)
       @memory_size = Integer(memory_size)
       @stdout_limit = Integer(stdout_limit)
@@ -41,7 +50,31 @@ module SecurityBox
       freeze
     end
 
+    # The fuel budget actually applied to each evaluation. When :fuel_ms is
+    # set it takes precedence: an approximate millisecond-based budget
+    # (fuel_ms × FUEL_PER_MS + boot allowance) instead of a raw fuel count.
+    # The epoch timeout remains the mandatory wall-clock backstop either way.
+    def effective_fuel
+      return fuel unless fuel_ms
+
+      fuel_ms * FUEL_PER_MS + BOOT_FUEL_ALLOWANCE
+    end
+
+    # Derives a copy with `changes` applied (never mutates the receiver).
+    # Passing both :fuel and a non-nil :fuel_ms is ambiguous and rejected;
+    # overriding :fuel on a configuration that uses :fuel_ms is rejected too
+    # (pass fuel_ms: nil first to switch to a raw fuel budget).
     def with(**changes)
+      if changes.key?(:fuel_ms)
+        if changes[:fuel_ms] && changes.key?(:fuel)
+          raise InvalidConfiguration,
+                "fuel and fuel_ms are mutually exclusive overrides"
+        end
+      elsif changes.key?(:fuel) && @fuel_ms
+        raise InvalidConfiguration,
+              "configuration uses fuel_ms (#{fuel_ms}); override fuel_ms or clear it with fuel_ms: nil instead of fuel"
+      end
+
       self.class.build(**to_h.merge(changes))
     end
 
@@ -49,6 +82,7 @@ module SecurityBox
       {
         image_path: @image_path,
         fuel: @fuel,
+        fuel_ms: @fuel_ms,
         timeout_ms: @timeout_ms,
         memory_size: @memory_size,
         stdout_limit: @stdout_limit,
@@ -87,7 +121,18 @@ module SecurityBox
       end
 
       def fuel(value)
+        raise InvalidConfiguration, "fuel and fuel_ms are mutually exclusive" if @changes.key?(:fuel_ms)
+
         @changes[:fuel] = value
+      end
+
+      # Rate-based fuel ergonomics: sets fuel from an approximate millisecond
+      # budget (see Configuration#effective_fuel). Mutually exclusive with
+      # an explicit :fuel.
+      def fuel_ms(value)
+        raise InvalidConfiguration, "fuel and fuel_ms are mutually exclusive" if @changes.key?(:fuel)
+
+        @changes[:fuel_ms] = value
       end
 
       def timeout_ms(value)

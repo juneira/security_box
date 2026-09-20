@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-15
+
+### Added
+
+- `SecurityBox::Pool` (`SecurityBox.pool`): a bounded pool of `:oneshot` sandboxes —
+  hard cap on concurrent evals (`size:`), sandbox reuse, `checkout` block and metrics
+  (`created`/`evals`/`total_ms`/`avg_ms`). Evals serialize on the GVL (documented).
+- `SecurityBox::RactorPool` (`SecurityBox.ractor_pool`): real parallelism — worker
+  Ractors sharing one Ractor-shareable Engine + compiled Module (stage-3 "Plan C").
+  Measured ≈0.52–0.53 parallel/serial wall ratio at 4 workers on 6 cores (~1.9x),
+  RSS ≈57MB; per-call overrides, statuses and trap recovery behave like
+  `Sandbox#eval`; a dead worker degrades to a `:sandbox_error` Result instead of a
+  hang.
+- `Configuration#fuel_ms`: rate-based fuel budgeting (~4e6 fuel/ms from the stage-3
+  calibration table + ~1e9 boot allowance), exposed via `Configuration#effective_fuel`
+  and usable per call. `fuel` and `fuel_ms` are mutually exclusive in the builder DSL
+  and in `#with`; switch back with `with(fuel_ms: nil, fuel: ...)`.
+- `docs/plan/stages/stage_4.md` with the worker-mode feasibility investigation.
+
+### Changed
+
+- The eval core was extracted from `Sandbox` into `SecurityBox::EvalRun` (shared by
+  `Sandbox` and `RactorPool` workers); `Sandbox` is now a thin, thread-safe wrapper.
+- README: the "Ractor note" roadmap item is delivered; concurrency guidance rewritten
+  around `Pool`/`RactorPool`.
+
+### Investigation (negative result, documented)
+
+- `:worker` mode (long-lived instance amortizing the ~240ms boot) is infeasible on
+  wasmtime-rb 48 (sync WASI): `invoke` holds the GVL during compute *and* while the
+  guest is blocked on a WASI read; epoch deadlines never fire inside a blocking
+  syscall; and per-request limits would require mutating a live Store from another
+  thread (unsafe). Evidence and probes in `docs/plan/stages/stage_4.md` and
+  `bin/spike_stage4_worker.rb`.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

@@ -29,6 +29,13 @@ module SecurityBox
       @status == :ok
     end
 
+    # Factory for the "the worker never answered" sandbox failure (dead or
+    # stalled Ractor worker, or the pop deadline elapsed).
+    def self.worker_unavailable(worker_index)
+      new(status: :sandbox_error,
+          stderr: "security_box: RactorPool worker #{worker_index} did not answer\n")
+    end
+
     def to_h
       {
         status: @status,

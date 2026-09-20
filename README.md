@@ -119,7 +119,7 @@ sandbox.eval("3 * 3").value # => 9
 ### Per-call limits
 
 Options can be passed per call (derived from the configuration without mutating it):
-`timeout_ms`, `fuel`, `memory_size`, `stdout_limit`, `stderr_limit`.
+`timeout_ms`, `fuel`, `fuel_ms`, `memory_size`, `stdout_limit`, `stderr_limit`.
 
 ```ruby
 # Wall-clock limit via epoch interruption
@@ -189,6 +189,7 @@ identity (equal settings → equal fingerprint), used to share runtime artifacts
 ```ruby
 config = SecurityBox::Configuration.build(
   fuel: 10_000_000_000,             # deterministic CPU budget
+  fuel_ms: nil,                     # or a millisecond-based budget (mutually exclusive with fuel)
   timeout_ms: 2_000,                # wall-clock limit (epoch interruption)
   memory_size: 512 * 1024 * 1024,   # wasm linear memory limit
   stdout_limit: 1 << 20,            # stdout capture capacity in bytes
@@ -233,12 +234,13 @@ string.
 Notes:
 
 - The guest Ruby version is the one from ruby.wasm (4.0), not necessarily the host's.
-- Concurrency: `invoke` holds the GVL, so executions serialize per host process. Scale
-  horizontally with multiple processes (e.g., Puma workers); a stuck guest still can't
-  hang the process thanks to the epoch deadline.
-- Ractor note: wasmtime `Engine`/`Module` are Ractor-shareable and Ractors run wasm in
-  parallel (measured ≈3.6x with 4 Ractors on 6 cores); a supported Ractor pool is on
-  the roadmap (see `docs/plan/stages/stage_3.md`).
+- Concurrency: `invoke` holds the GVL, so executions on threads serialize — use
+  `RactorPool` (below) for parallelism inside one process, or scale horizontally with
+  multiple processes (e.g., Puma workers). A stuck guest still can't hang the process
+  thanks to the epoch deadline.
+- Ractor: wasmtime `Engine`/`Module` are Ractor-shareable and Ractors run wasm in
+  parallel — measured ≈1.9x wall-time speedup at 4 workers on 6 cores through
+  `RactorPool` (see `docs/plan/stages/stage_3.md` and `stage_4.md`).
 - Memory: the packed image declares a 1528-page (~95.5 MiB) minimum; `memory_size`
   below that fails instantiation (reported as `:sandbox_error`). Practical minimum is
   ~128–144MB for small workloads; the 512MB default leaves comfortable headroom.
@@ -246,7 +248,57 @@ Notes:
   and every eval costs ~1e9 fuel for boot — see the calibration table in
   `docs/plan/stages/stage_3.md`. Consequently `fuel` below ~1e9 cannot even boot, and
   `timeout_ms` below ~300ms times out during the guest boot (~500ms is a practical
-  floor).
+  floor). Prefer thinking in milliseconds? Use `fuel_ms` (below).
+
+## Concurrency
+
+Two pools are available, with honestly different guarantees (measured in stage 4 —
+`invoke` holds the GVL, so a long-lived `:worker` instance is impossible on the current
+wasmtime-rb; one wasm boot per eval stays on the hot path):
+
+### `Pool` — bounded concurrency on threads
+
+```ruby
+pool = SecurityBox.pool(:lean, size: 4)
+pool.eval("40 + 2").value    # => 42
+pool.checkout { |sandbox| sandbox.eval("1 + 1") }
+pool.metrics                 # => {size:, created:, evals:, total_ms:, avg_ms:}
+pool.shutdown
+```
+
+Caps concurrent evals at `size` and reuses sandbox objects, but evals serialize on the
+GVL — one at a time.
+
+### `RactorPool` — real parallelism
+
+```ruby
+pool = SecurityBox.ractor_pool(:lean, size: 4)
+pool.eval("40 + 2").value    # => 42
+pool.shutdown
+```
+
+Worker Ractors share one Engine + compiled Module and run wasm truly in parallel
+(~1.9x wall-time speedup at 4 workers on 6 cores; measured ≈0.53 parallel/serial wall
+ratio across 1M–4M-iteration workloads). Per-call overrides, user errors, timeouts and
+fuel exhaustion behave exactly like `Sandbox#eval`, and the worker survives traps and
+keeps serving. Costs one module deserialize at creation (~0.5s via the disk cache);
+each eval still pays the ~240ms guest boot.
+
+### `fuel_ms` — rate-based fuel budgeting
+
+Instead of counting raw fuel, budget approximate wall-time of compute:
+
+```ruby
+config = SecurityBox::Configuration.build(fuel_ms: 100) # ≈100ms of compute + boot allowance
+SecurityBox.spawn(config).eval("i = 0; while i < 5_000_000; i += 1; end").status
+# => :fuel_exhausted (5M tight iterations ≈ 2.4e9 fuel > the 100ms budget)
+```
+
+`fuel_ms` converts to fuel with the conservative stage-3 calibration rate
+(4e6 fuel/ms ≈ 4e9 fuel/s) plus a ~1e9 boot allowance (`Configuration#effective_fuel`).
+The epoch `timeout_ms` remains the mandatory wall-clock backstop. `fuel` and `fuel_ms`
+are mutually exclusive in the builder DSL and in `#with` overrides; a `fuel_ms`
+configuration can be switched back with `with(fuel_ms: nil, fuel: ...)`.
 
 ## Running the tests
 
@@ -284,3 +336,5 @@ bundle exec ruby bin/spike.rb
   integrity, compiled-module disk cache)
 - `docs/plan/stages/stage_3.md` — stage 3 findings (named profiles, Ractor
   parallelism, memory floor, fuel calibration, backtrace)
+- `docs/plan/stages/stage_4.md` — stage 4 findings (worker-mode feasibility, pools,
+  `fuel_ms`)

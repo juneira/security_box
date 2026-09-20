@@ -35,6 +35,91 @@ RSpec.describe SecurityBox::Configuration do
     end
   end
 
+  describe "fuel_ms" do
+    it "defaults to nil" do
+      expect(described_class.build.fuel_ms).to be_nil
+    end
+
+    it "defaults fuel to the raw budget" do
+      expect(described_class.build.effective_fuel).to eq(described_class::DEFAULTS[:fuel])
+    end
+
+    it "computes effective_fuel from the rate and the boot allowance" do
+      config = described_class.build(fuel_ms: 100)
+
+      expect(config.effective_fuel).to eq(100 * described_class::FUEL_PER_MS +
+                                          described_class::BOOT_FUEL_ALLOWANCE)
+    end
+
+    it "takes precedence over the default raw fuel" do
+      config = described_class.build(fuel_ms: 50)
+
+      expect(config.effective_fuel).not_to eq(config.fuel)
+    end
+
+    it "accepts an explicit nil (raw fuel wins again)" do
+      config = described_class.build(fuel: 5_000, fuel_ms: nil)
+
+      expect(config.fuel).to eq(5_000)
+      expect(config.effective_fuel).to eq(5_000)
+    end
+
+    it "feeds the fingerprint" do
+      base = described_class.build(fuel: 1_000)
+
+      expect(base.with(fuel_ms: 100).fingerprint).not_to eq(base.fingerprint)
+    end
+
+    it "rejects a #with that combines fuel and fuel_ms" do
+      config = described_class.build(fuel: 1_000)
+
+      expect { config.with(fuel: 2_000, fuel_ms: 100) }
+        .to raise_error(SecurityBox::InvalidConfiguration, /mutually exclusive/)
+    end
+
+    it "rejects overriding fuel on a fuel_ms configuration" do
+      config = described_class.build(fuel_ms: 100)
+
+      expect { config.with(fuel: 2_000) }
+        .to raise_error(SecurityBox::InvalidConfiguration, /fuel_ms/)
+    end
+
+    it "allows switching back to raw fuel via fuel_ms: nil" do
+      config = described_class.build(fuel_ms: 100)
+      derived = config.with(fuel_ms: nil, fuel: 2_000)
+
+      expect(derived.fuel_ms).to be_nil
+      expect(derived.effective_fuel).to eq(2_000)
+    end
+
+    it "rejects the combination in the builder DSL" do
+      SecurityBox::Registry.clear!
+      begin
+        expect {
+          SecurityBox.register(:conflicted) do |c|
+            c.fuel 1_000
+            c.fuel_ms 100
+          end
+        }.to raise_error(SecurityBox::InvalidConfiguration, /mutually exclusive/)
+      ensure
+        SecurityBox::Registry.clear!
+      end
+    end
+
+    it "rejects a fuel override derived from a fuel_ms base profile" do
+      SecurityBox::Registry.clear!
+      begin
+        SecurityBox.register(:rated) { |c| c.fuel_ms 100 }
+
+        expect {
+          SecurityBox.register(:derived, from: :rated) { |c| c.fuel 1_000 }
+        }.to raise_error(SecurityBox::InvalidConfiguration, /fuel_ms/)
+      ensure
+        SecurityBox::Registry.clear!
+      end
+    end
+  end
+
   describe "#fingerprint" do
     it "is equal for identically configured objects" do
       a = described_class.build(fuel: 100, env: { "LANG" => "C" })

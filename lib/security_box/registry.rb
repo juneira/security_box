@@ -21,7 +21,12 @@ module SecurityBox
 
           builder = Configuration::Builder.new
           block&.call(builder)
-          @profiles[key] = Configuration.build(**base_of(from), **builder.changes)
+          base = base_of(from)
+          if base[:fuel_ms] && builder.changes.key?(:fuel)
+            raise InvalidConfiguration,
+                  "base profile #{from.inspect} uses fuel_ms; override fuel_ms (or clear it with fuel_ms: nil) instead of fuel"
+          end
+          @profiles[key] = Configuration.build(**base, **builder.changes)
         end
       end
 

@@ -9,6 +9,9 @@ require_relative "security_box/module_cache"
 require_relative "security_box/runtime"
 require_relative "security_box/envelope"
 require_relative "security_box/sandbox"
+require_relative "security_box/eval_run"
+require_relative "security_box/pool"
+require_relative "security_box/ractor_pool"
 
 module SecurityBox
   # Convenience shortcut:
@@ -43,6 +46,21 @@ module SecurityBox
                      "profile must be a registered name or a Configuration, got #{profile.class}"
              end
     Sandbox.new(config)
+  end
+
+  # Builds a Pool of :oneshot sandboxes (bounded concurrency on threads).
+  # NOTE: evals serialize on the GVL — see RactorPool for parallelism.
+  #   SecurityBox.pool(:lean, size: 4).eval("1 + 1")
+  def self.pool(profile = nil, size: 4, **overrides)
+    Pool.new(profile, size: size, **overrides)
+  end
+
+  # Builds a RactorPool (real parallelism: worker Ractors sharing one
+  # Engine+Module). Costs one module deserialize at creation (~0.5s via the
+  # disk cache); each eval still pays the guest boot (~240ms).
+  #   SecurityBox.ractor_pool(:lean, size: 4).eval("1 + 1")
+  def self.ractor_pool(profile = nil, size: 4, **overrides)
+    RactorPool.new(profile, size: size, **overrides)
   end
 
   # Prepares the shared runtime artifacts (Engine + compiled Module) ahead of
