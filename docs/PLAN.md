@@ -1,5 +1,11 @@
 # Plan: `security_box` — sandbox for untrusted Ruby with ruby.wasm + wasmtime
 
+> **Status**: stages 1–4 are delivered and shipped as gem releases 0.1.0–0.4.0.
+> This document reflects what actually shipped; the measured evidence lives in the
+> stage documents (`docs/plan/stages/`). The roadmap in §9 carries the remaining
+> scope: stage 5 (folder mounts) is next, followed by the image builder (M3) and
+> the CLI (M5), with a backlog of revisit triggers.
+
 ## 1. Goal
 
 Provide a Ruby library (`security_box`) that runs **untrusted** Ruby code inside a
@@ -8,32 +14,39 @@ gem as an embedded runtime in the host Ruby process.
 
 Core requirements:
 
-1. **Real isolation**: the guest code has no network, cannot see the host filesystem,
-   cannot create processes, and cannot escape the wasm runtime.
+1. **Real isolation**: the guest code has no network, cannot see the host filesystem
+   (except explicitly mounted folders), cannot create processes, and cannot escape
+   the wasm runtime.
 2. **Mandatory limits**: time (wall-clock), CPU (fuel), memory, output size.
-3. **Reusable configurations**: an immutable configuration object, cheap to clone, that
-   can be shared by several sandboxes and used as a named "profile".
-4. **Spawn several sandboxes easily**: predictable creation cost, pool of hot instances,
-   and concurrent execution (wasmtime-rb `invoke` releases the GVL).
+3. **Reusable configurations**: an immutable configuration object, cheap to clone,
+   usable as a named "profile" and as a cache key (fingerprint).
+4. **Easy spawning and concurrency**: predictable per-eval cost, a bounded `Pool`
+   for resource bounding, and real parallelism via `RactorPool` (`invoke` holds the
+   GVL, so threads alone cannot parallelize executions).
 
 ### Non-goals (v1)
 
 - Running gems with arbitrary native extensions inside the guest (only pure-Ruby gems
   packaged into the image).
 - Threads inside the guest (ruby.wasm/wasip1 does not support `Thread`).
-- WASI Preview 2 components (we will use Preview 1, which is what ruby.wasm publishes today).
+- WASI Preview 2 components (we use Preview 1, which is what ruby.wasm publishes today).
+- Long-lived worker instances: rejected with evidence on wasmtime-rb 48 — `invoke`
+  holds the GVL while the guest computes *and* while it is blocked on a WASI read, and
+  epoch deadlines never fire inside a blocking syscall (stage 4 Q1/Q2). Revisit only
+  when wasmtime-rb ships GVL-releasing/async WASI.
 - High *throughput* performance per sandbox — we prioritize isolation and predictability.
 
 ---
 
-## 2. How execution works (validated fundamentals)
+## 2. How execution works (validated)
 
 - ruby.wasm publishes prebuilt binaries per version + profile
-  (`ruby-4.0-wasm32-unknown-wasip1-full`, `...-minimal`).
-- To run a script, we pack the runtime + stdlib + our "supervisor" script into a single
-  `.wasm` with an embedded VFS (`rbwasm pack` / `RubyWasm::Packager` + wasi-vfs). Result: **one
-  self-contained file**, no need to pre-open host directories at runtime.
-- The module exposes `_start` (WASI command). On the host:
+  (`ruby-4.0-wasm32-unknown-wasip1-full`). We pack the runtime + stdlib + the guest
+  entrypoint + hardening prelude into a single self-contained `.wasm` with an embedded
+  VFS (`rbwasm pack`; `/usr` and `/src` are embedded, read-only to the guest).
+- Per `#eval` (`:oneshot`, the only mode): the host creates a sandbox-exclusive tmpdir,
+  writes the user code to it, mounts it read-write as `/work`, generates a per-eval
+  random token delivered via `SB_TOKEN`, then boots a fresh wasm instance:
 
 ```ruby
 engine   = Wasmtime::Engine.new(epoch_interruption: true, consume_fuel: true)
@@ -43,102 +56,103 @@ Wasmtime::WASI::P1.add_to_linker_sync(linker)
 
 wasi = Wasmtime::WasiConfig.new
   .set_stdin_string("")                       # never inherit host stdin
-  .set_stdout_buffer(String.new, 1 << 20)     # captured + limited output
-  .set_stderr_buffer(String.new, 1 << 16)
+  .set_stdout_buffer(stdout, stdout_limit)    # captured + limited output
+  .set_stderr_buffer(stderr, stderr_limit)
   .set_argv(["ruby", "/src/main.rb"])
-  .set_env({})
+  .set_env(config.env.merge("SB_TOKEN" => token))
+  .set_mapped_directory(workdir, "/work", :read_write)
 
 store = Wasmtime::Store.new(engine, wasi_p1_config: wasi,
-                            limits: { memory_size: 64 * 1024 * 1024 })
+                            limits: { memory_size: config.memory_size })
+store.set_fuel(config.effective_fuel)
 instance = linker.instantiate(store, mod)
-instance.invoke("_start")                     # releases the GVL during execution
+store.set_epoch_deadline(timeout_ms / epoch_interval_ms + 1)  # right before invoke
+instance.invoke("_start")
+store.close
 ```
 
-- Available limits we will use: `Engine.new(consume_fuel:, epoch_interruption:, max_wasm_stack:)`,
-  `Store.new(limits: { memory_size:, instances:, memories:, tables:, table_elements: })`,
-  `store.set_fuel`, `store.set_epoch_deadline`, `store.linear_memory_limit_hit?`, `store.close`.
-- Structured result: the guest writes a JSON envelope into a directory that is **exclusive to
-  the sandbox**, mounted as `/work` (read-write). The host reads `/work/out.json`. This avoids
-  the pitfalls of "forging" delimiters on stdout.
+- **GVL fact (stage 4 Q1)**: `invoke` **holds the GVL** in every guest state.
+  Executions on threads serialize; real parallelism comes from `RactorPool`
+  (wasmtime `Engine`/`Module` are Ractor-shareable). A stuck guest still cannot
+  hang the process — the epoch deadline fires from a native timer.
+- Structured result: the guest writes a token-signed JSON envelope to `/work/out.json`
+  (read back and verified by the guest before exiting), with a stdout sentinel
+  fallback; the host validates schema + token before surfacing anything.
+- Limits in use: `consume_fuel` + `set_fuel`, `epoch_interruption` + `set_epoch_deadline`,
+  `limits: { memory_size: }` (+ `linear_memory_limit_hit?`), stdout/stderr buffer
+  capacities, `store.close` on teardown.
 
 ---
 
 ## 3. Architecture
 
 ```
-Configuration (immutable, reusable)
-        │  fingerprint
+Configuration (immutable, #with, fingerprint, fuel_ms) ──► Registry (named profiles)
+        │
         ▼
-   Image (build + cache) ──► .wasm file ──► Runtime (Engine + compiled Module, cwasm cache)
-        │                                              │
-        └────────────────► Sandbox (Store + Instance) ◄┘        Pool (hot instances)
-                                     │
-                                  Result
+   Image (assets/security_box.wasm, repack task) ──► Runtime (Engine cache + compiled Module
+        │                                              + content-addressed .cwasm disk cache)
+        └────────► EvalRun (shared eval core) ◄────────┘
+                       │                       └──► RactorPool (worker Ractors, shareable Engine+Module)
+                       ├──► Sandbox (thread-safe wrapper)
+                       └──► Pool (bounded :oneshot sandboxes)
+                                   │
+                                 Result ◄── Envelope (schema + token validation)
 ```
 
 | Layer | Responsibility |
 |---|---|
-| `Configuration` | All sandbox parameters. Immutable; `#with(**changes)` returns a copy. |
-| `Image` / `ImageBuilder` | Resolves/builds the `.wasm` (runtime + stdlib + gems + `guest/main.rb`), cached by fingerprint. |
-| `Runtime` | `Wasmtime::Engine` + compiled `Module` (and `.cwasm` cache) per config fingerprint. Shared across sandboxes and threads. |
-| `Sandbox` | One `Store` + `Instance` per execution (or per worker). Applies WASI config, limits and deadlines. |
-| `Result` | `stdout`, `stderr`, `value`, `error`, `duration_ms`, `fuel_used`, `status`. |
-| `Pool` | Keeps N hot sandboxes per profile, returns them to the pool or discards (`store.close`) per limits. |
+| `Configuration` | Immutable; Builder DSL, `#with`, `#fingerprint`, `fuel_ms` → `#effective_fuel`. |
+| `Registry` | Named profiles (`register`/`resolve`); profiles never mutate. |
+| `ModuleCache` | Content-addressed `.cwasm` disk cache (best effort, atomic writes). |
+| `Runtime` | `Engine` cache per `epoch_interval_ms`, compiled `Module` per `(engine, image_path)`; `build_shareable` for Ractor pools. |
+| `EvalRun` | One `:oneshot` evaluation: WASI config, limits, invoke, trap mapping, envelope read. Shared by `Sandbox` and Ractor workers. |
+| `Sandbox` | Thin, thread-safe wrapper over `EvalRun`. |
+| `Envelope` | Host-side schema + token validation (forged results → `:sandbox_error`). |
+| `Result` | `status`, `value`, `error` (with `backtrace`), `stdout`, `stderr`, `fuel_used`, `duration_ms`, `guest_duration_ms`. |
+| `Pool` | Bounded concurrency + sandbox reuse + metrics; serializes on the GVL (documented). |
+| `RactorPool` | Real parallelism: worker Ractors sharing one shareable Engine+Module; collector routes results by request id. |
 
 ---
 
-## 4. Public API (target)
+## 4. Public API (as delivered)
 
 ```ruby
-# Named, reusable profiles
-SecurityBox.register(:default) do |c|
-  c.ruby_version "4.0"
-  c.profile      :full                 # :full | :minimal
-  c.stdlib       %w[json yaml]         # extra components to keep (:minimal starts empty)
-  c.gems         []                    # pure-Ruby gems allowlist, baked into the image
+SecurityBox.eval(code, **overrides)                 # one-shot Result
+SecurityBox.warmup                                  # pre-build Engine + Module (skips cold compile)
 
-  c.memory_limit 64 * 1024 * 1024
-  c.fuel         50_000_000
-  c.timeout_ms   2_000                 # epoch interruption
-  c.output_limit 1 << 20
-  c.max_wasm_stack 1 << 20
-
-  c.env          "LANG" => "C"
-  c.mount        "./data" => "/data"   # read-only by default
-  c.mount_rw     nil                   # nothing writable outside /work
-
-  c.mode         :oneshot              # :oneshot | :worker (phase 4)
-  c.hardening    :standard             # prelude that removes dangerous APIs
-end
+sandbox = SecurityBox::Sandbox.new(config)
+sandbox.eval(code, timeout_ms: 500)                 # per-call overrides, profile unchanged
 
 SecurityBox.register(:lean, from: :default) do |c|
-  c.profile :minimal
-  c.fuel    5_000_000
+  c.fuel 2_000_000_000                              # or c.fuel_ms 200 (rate-based)
   c.timeout_ms 500
 end
+box = SecurityBox.spawn(:lean)                      # Sandbox from a profile
+SecurityBox.spawn(:lean, fuel: 1_000)               # per-call override via #with
 
-# Usage: spawn as many as you want, concurrently
-box = SecurityBox.spawn(:lean)              # or SecurityBox.spawn(:default, fuel: 1_000)
-res = box.eval(<<~RUBY)
-  require "json"
-  puts JSON.generate({ok: true})
-  exit 0
-RUBY
+pool = SecurityBox.pool(:lean, size: 4)             # bounded concurrency (GVL-serial)
+pool.eval(code); pool.metrics; pool.shutdown
+rpool = SecurityBox.ractor_pool(:lean, size: 4)     # real parallelism (worker Ractors)
+rpool.eval(code); rpool.shutdown
 
-res.status      # => :ok | :error | :timeout | :fuel_exhausted | :memory_limit | :output_truncated
-res.stdout      # => "{\"ok\":true}\n"
-res.value       # => return value (JSON-serializable)
-res.error       # => {class:, message:, backtrace:} when :error
-res.duration_ms # => 12.4
-res.fuel_used   # => 1_284_311
-
-# Pool for frequent spawns
-pool = SecurityBox::Pool.new(:default, size: 8, max_age: 100)
-pool.checkout { |sandbox| sandbox.eval(code) }
+config = SecurityBox::Configuration.build(
+  fuel: ..., fuel_ms: ..., timeout_ms:, memory_size:,
+  stdout_limit:, stderr_limit:, epoch_interval_ms:, env:
+)
+config.with(**changes)      # derived copy
+config.fingerprint          # stable identity (SHA-256 of the canonical hash)
+config.effective_fuel       # fuel_ms-aware (4e6 fuel/ms + ~1e9 boot allowance)
 ```
 
-`Configuration#with` never mutates the original; `Runtime` is memoized by fingerprint, so a
-thousand `spawn`s of the same config share the same compiled `Engine`/`Module`.
+Pending API (stage 5 — folder mounts, the M2 leftover):
+
+```ruby
+SecurityBox.register(:reader) do |c|
+  c.mount    "./data" => "/data"   # read-only by default
+  c.mount_rw nil                   # nothing writable outside /work
+end
+```
 
 ---
 
@@ -146,159 +160,205 @@ thousand `spawn`s of the same config share the same compiled `Engine`/`Module`.
 
 | Threat | Defense |
 |---|---|
-| Infinite loop / CPU | `epoch_interruption` + `store.set_epoch_deadline` (wall-clock) **and** `consume_fuel` + `store.set_fuel` (deterministic budget) |
-| Memory (bomb) | `limits: { memory_size: }` + check of `store.linear_memory_limit_hit?` |
-| Stack overflow / recursion | `max_wasm_stack` + rescue of `SystemStackError` in the guest |
-| Host disk/RAM exhaustion from many instances | `Pool` with a maximum size + `store.close` on return/discard |
-| Network | Never call `inherit_network`/`allow_tcp`/`allow_udp` — ruby.wasm WASI p1 already has no sockets |
-| Host filesystem | No pre-opened directories by default; only `/work` (tmpdir per sandbox) and explicit mounts, read-only by default |
-| Processes / `system` / backticks / fork | Nonexistent in wasip1; the `hardening` prelude also removes whatever is left |
-| stdout flood | `set_stdout_buffer(buf, capacity)` — truncates with a configurable limit |
-| ENV/argv leak | Explicit `set_env({})`; only allowed variables |
-| Runtime escape | There are no native syscalls in wasmtime p1 without an explicit import; we keep imports restricted to WASI |
+| Infinite loop / CPU | `epoch_interruption` + `set_epoch_deadline` (wall-clock, set right before `invoke`) **and** `consume_fuel` + `set_fuel` (deterministic budget) |
+| Memory (bomb) | `limits: { memory_size: }` + `linear_memory_limit_hit?`; guest `NoMemoryError` → `:memory_limit`; module floor 1528 pages (~95.5 MiB) → below it `:sandbox_error` |
+| Stack overflow / recursion | rescued in the guest (`SystemStackError` → `:error` envelope) |
+| Host disk/RAM exhaustion | `Pool` hard cap on concurrent evals; `store.close` on every teardown |
+| Network | WASI p1 has no sockets (`require "socket"` → `LoadError`) |
+| Host filesystem | No pre-opened directories: only the sandbox-exclusive `/work` tmpdir (rw). Explicit folder mounts arrive in stage 5 — read-only by default |
+| Processes / `system` / backticks / fork | Nonexistent in wasip1; the hardening prelude also neutralizes `system`, `exec`, `Kernel#spawn`, backticks, `IO.popen`, `Process.spawn`, `Kernel#open` (all raise `SecurityError`) |
+| stdout flood | `set_stdout_buffer(buf, capacity)` truncates at the configured limit |
+| ENV/argv leak | `set_env` only carries allowed variables + the per-eval token; the prelude captures `SB_TOKEN` and scrubs `ENV` before user code runs |
+| Forged results | Token-validated envelope (`/work/out.json` + sentinel fallback); strict schema validation; guest verifies its own envelope write; forged results → `:sandbox_error` |
 
-Extra hardening (optional, `:standard`): a prelude loaded before user code that
-cleans `ENV`, refines/removes `File` write ops when there is no RW mount, disables dynamic
-`Kernel#require` from outside the image, and applies `$stdout.sync = true`. **Primary isolation
-is WASI, not the prelude** — the prelude is defense in depth.
+**Primary isolation is WASI + the wasm runtime; the prelude is defense in depth.**
+Optional prelude refinement (stage 5 decision): restrict guest `File` write operations
+when there is no writable mount — candidate defense-in-depth for the mounts milestone.
 
 ---
 
 ## 6. Host ↔ guest protocol
 
-### `:oneshot` mode (default, Phase 2)
+### `:oneshot` (delivered, the only mode)
 
-1. Host creates the sandbox-exclusive tmpdir, writes `/work/code.rb` (or `in.json`).
-2. Mounts `/work` read-write via `set_mapped_directory(tmpdir, "/work", :read_write)`.
-3. Instantiates and invokes `_start`; the guest (`lib/security_box/guest/main.rb`):
-   - reads `/work/code.rb`, evaluates it inside a `begin/rescue` with `$stdout` redirected,
-   - serializes the envelope `{ok, value, error, backtrace, duration_ms}` into `/work/out.json`,
-   - exits with `exit 0` (even on user error — a user error is a *result*, not a sandbox failure).
-4. Host reads `/work/out.json`, applies `store.close`, removes the tmpdir.
+1. Host generates a 128-bit token, creates the sandbox-exclusive tmpdir, writes
+   `/work/code.rb`, mounts `/work` read-write, injects the token via `SB_TOKEN`.
+2. Fresh instance boots; the prelude captures the token, scrubs `ENV`, neutralizes
+   process-spawn APIs, sets `$stdout.sync = true`.
+3. The guest evaluates the code with `$stdout` captured, serializes
+   `{ok, value, error, backtrace, duration_ms, token}` to `/work/out.json`,
+   re-reads it to verify the write (falling back to the stdout sentinel on mismatch),
+   and exits 0 — user errors are results, not sandbox failures.
+4. The host validates the envelope (schema + token), maps traps to statuses
+   (`:interrupt` → `:timeout`, `:out_of_fuel` → `:fuel_exhausted`,
+   memory traps/`linear_memory_limit_hit?` → `:memory_limit`, else `:sandbox_error`),
+   closes the store, discards the tmpdir.
 
-Advantage: a fresh wasm process per execution ⇒ zero residual state between executions, no
-need for a "reset".
+Zero residual state between executions (one wasm process per eval).
 
-### `:worker` mode (Phase 4, only if the benchmark justifies it)
+### `:worker` mode — rejected (stage 4)
 
-A long-lived instance that processes several requests, to amortize the instantiation cost.
-Candidate channels, in order of preference to validate in the spike:
-
-1. **FIFOs** pointed to by `set_stdin_file` / `set_stdout_file` (host writes requests, guest
-   reads blocking; host reads responses from another thread — `invoke` releases the GVL).
-2. **Files with double buffering** in `/work` + short polling (simple and portable fallback).
-
-We will only adopt it if the instantiation cost measured in M0 is high (e.g., > 10 ms). Otherwise,
-the `:oneshot` mode + a pre-warming pool with `InstanceAllocationStrategy::Pooling` solves it.
-
----
-
-## 7. Reusable configurations (design details)
-
-- `Configuration` is `Data`/frozen; `#with` uses a shallow merge per group (`image:`, `limits:`,
-  `wasi:`, `runtime:`), and the fingerprint is a `Digest::SHA256` of the normalized hash.
-- Two levels of cache derived from the fingerprint:
-  - `~/.cache/security_box/images/<sha>.wasm` — packed image;
-  - `~/.cache/security_box/modules/<sha>-<precompile_key>.cwasm` — compiled module
-    (`Module#serialize` + `deserialize_file`, key from `engine.precompile_compatibility_key`).
-- `Runtime` keeps the `Engine` + `Module` in a global registry (`SecurityBox::Runtime.registry`),
-  protected by a mutex; `Engine`/`Module` are thread-safe and reusable.
-- `spawn` never builds anything at runtime: if the fingerprint is not in cache and the build is
-  disabled (production), it raises `SecurityBox::ImageMissing`. Build is an explicit step
-  (`rake security_box:build` / `SecurityBox.build_all!`).
-- Named profiles allow `SecurityBox.spawn(:lean)`, `SecurityBox.spawn(:lean, fuel: 1000)`, and
-  `SecurityBox::Pool.new(:lean)` — all sharing the same image/module when possible.
+A long-lived instance amortizing the ~240ms guest boot is infeasible on wasmtime-rb 48
+(sync WASI): `invoke` holds the GVL in every guest state (compute *and* blocked reads),
+epoch deadlines cannot interrupt a guest sitting in a blocking syscall, and per-request
+limits would require cross-thread mutation of a live Store. **Revisit trigger**: a
+wasmtime-rb release with GVL-releasing/async WASI or a safe limit re-arm API. The probe
+scripts live in `bin/spike_stage4_worker.rb`; full evidence in `docs/plan/stages/stage_4.md`.
 
 ---
 
-## 8. File structure
+## 7. Reusable configurations
+
+Delivered:
+
+- `Configuration` is immutable (`Configuration.build` + `#with` derivation); the
+  Builder DSL collects only changed values; `env` replaces (not merges).
+- `#fingerprint`: SHA-256 of the canonical configuration — equal settings produce
+  equal fingerprints; ready for cache identity (used by profile identity/diagnostics;
+  artifact keying lands with the ImageBuilder).
+- Runtime sharing: engines are memoized per `epoch_interval_ms`, compiled modules per
+  `(engine, image_path)`; the `.cwasm` disk cache is content-addressed (image digest +
+  `precompile_compatibility_key`), so a new process boots the runtime in ~0.5s
+  instead of ~15s.
+- Named profiles: `SecurityBox.register(:name, from: :base)`, `SecurityBox.spawn(:name,
+  **overrides)`; strict registry (duplicate/unknown names raise `InvalidConfiguration`).
+
+Pending (M3): `ImageBuilder` (ruby version, profile `:full`/`:minimal`, stdlib
+allowlist, pure-Ruby gems) and fingerprint-keyed image + compiled-module caches;
+build becomes an explicit step (`SecurityBox.build_all!` / rake), with
+`SecurityBox::ImageMissing` when a needed image is not built.
+
+---
+
+## 8. File structure (as delivered)
 
 ```
-lib/security_box.rb                       # public API: register/spawn/build_all!
-lib/security_box/configuration.rb         # immutable + #with + fingerprint
-lib/security_box/registry.rb              # named profiles + runtime/image caches
-lib/security_box/image.rb                 # resolution + fingerprint + cache
-lib/security_box/image_builder.rb         # rbwasm pack / RubyWasm::Packager
-lib/security_box/runtime.rb               # Engine + Module (+ cwasm cache)
-lib/security_box/sandbox.rb               # Store/Instance, WASI config, limits, eval
-lib/security_box/result.rb                # result envelope
-lib/security_box/errors.rb                # SecurityBox::Error, Timeout, FuelExhausted, ...
-lib/security_box/pool.rb                  # pool of hot sandboxes
-lib/security_box/guest/main.rb            # packed script (entrypoint _start)
-lib/security_box/guest/prelude.rb         # optional hardening
+lib/security_box.rb                       # eval/warmup/register/spawn/pool/ractor_pool
+lib/security_box/configuration.rb         # immutable + Builder DSL + #with + fingerprint + fuel_ms
+lib/security_box/registry.rb              # named profiles (register/resolve/profiles/clear!)
+lib/security_box/module_cache.rb          # content-addressed .cwasm disk cache
+lib/security_box/runtime.rb               # Engine cache + compiled Module + build_shareable
+lib/security_box/eval_run.rb              # shared eval core (Sandbox + Ractor workers)
+lib/security_box/sandbox.rb               # thread-safe wrapper over EvalRun
+lib/security_box/envelope.rb              # host-side envelope schema + token validation
+lib/security_box/result.rb                # Result (+ worker_unavailable)
+lib/security_box/pool.rb                  # bounded pool of :oneshot sandboxes + metrics
+lib/security_box/ractor_pool.rb           # Ractor workers on a shareable Engine+Module
+lib/security_box/errors.rb                # Error, ImageMissing, InvalidConfiguration, PoolClosed
+lib/security_box/guest/main.rb            # packed entrypoint (_start): envelope + sentinel
+lib/security_box/guest/prelude.rb         # hardening: token capture, ENV scrub, API neutralization
 lib/security_box/version.rb
-exe/security_box                          # CLI: security_box eval / build / doctor
-security_box.gemspec                      # deps: wasmtime (runtime), ruby_wasm (build, optional)
-spec/…                                    # unit + integration + escape matrix + benchmarks
+lib/security_box/assets/security_box.wasm # packed image (not committed; repack task)
+Rakefile                                  # spec, security_box:build_image, verify_image
+bin/spike.rb                              # stage-1 spike (Q1–Q9)
+bin/spike_stage3*.rb, bin/spike_stage4_worker.rb  # calibration/Ractor/pooling/worker probes
+spec/…                                    # unit + integration + escape matrix
 ```
 
-Dependencies: `wasmtime` (runtime, precompiled gem; add platforms to the lock:
-`x86_64-linux`, `aarch64-linux`, `arm64-darwin`, `x86_64-darwin`), `ruby_wasm` (build only),
-`json` (stdlib).
+Not yet present (planned): `image.rb`/`image_builder.rb` (M3), `exe/security_box`
+CLI (M5).
+
+Dependencies: `wasmtime` (runtime), `ruby_wasm` (build only), `json` (stdlib).
 
 ---
 
-## 9. Phases
+## 9. Roadmap
 
-### M0 — Feasibility spike (1–2 days)
-- Download `ruby-4.0-wasm32-unknown-wasip1-full`, pack `guest/main.rb` with `rbwasm pack`.
-- Run via wasmtime-rb: basic `puts`, stdout capture, JSON required from inside the wasm.
-- Validate interruption: infinite loop killed by `epoch`, and by `fuel`.
-- Measure: image size, cold/warm `_start` time, memory peak per instance.
-- **Exit criterion**: documented numbers in `docs/benchmarks.md` + `:oneshot` vs `:worker` decision.
+### Delivered — stages 1–4
 
-### M1 — Core
-`Configuration`, `Runtime`, one-shot `Sandbox#eval`, `Result`, errors, `register/spawn` API.
-Unit + integration tests.
+| Stage | Focus | Outcome (see stage doc) |
+|---|---|---|
+| 1 (0.1.0) | Feasibility spike | Core `eval`, all limits, isolation matrix; eval p50 ~257ms; GVL held → serial per process |
+| 2 (0.2.0) | Hardening + cold-boot | Token channel + envelope validation, hardening prelude, `.cwasm` disk cache (~15.6s → ~0.56s warm boot) |
+| 3 (0.3.0) | Profiles + calibration | `register`/`spawn`, `#fingerprint`, Ractor shareability evidence, memory floor, fuel calibration table, guest backtrace, verified envelope write |
+| 4 (0.4.0) | Concurrency | `:worker` mode rejected (GVL evidence), `Pool` + `RactorPool` (~1.9x at 4 workers), `fuel_ms`, `EvalRun` extraction |
 
-### M2 — Isolation and limits
-Fuel/epoch/memory/output-limit, read-only mounts, sanitized env, `/work` per sandbox, hardening
-prelude, `store.close`, trap translation (`Wasmtime::Trap`) into `Result#status`.
+### Stage 5 — Folder mounts (next; completes the M2 leftover)
 
-### M3 — Images and cache
-`ImageBuilder` (version, profile, stdlib components, gems allowlist), fingerprint, disk cache,
-compiled module cache, rake tasks, `security_box build`.
+Mount host folders into the sandbox explicitly, read-only by default, so guest code
+can safely read a host directory.
 
-### M4 — Pool and concurrency
-`Pool` with size/limits, pre-warming, metrics (spawns, average time, discards), concurrent load
-test; `:worker` mode spike if justified by M0.
+- `Configuration` DSL: `c.mount "host/path" => "/data"` (read-only) and `c.mount_rw`
+  (opt-in writable, nothing outside `/work` by default).
+- `EvalRun`: apply mounts via `set_mapped_directory` after `/work`; host-side
+  validation (absolute existing paths, guest-path collisions with `/work`/`/usr`/
+  `/src`, duplicates, mount count).
+- Behavior probes: read-only mount write failures (`Errno::EROFS` or equivalent),
+  coexistence/shadowing with the embedded VFS (stage 1 proved one mount; validate N),
+  per-eval cost.
+- Decision needed: prelude File-write restriction when no RW mount exists
+  (defense in depth).
+- Exit criterion: read-only + RW mount matrix green against the real image; mounted
+  content read by guest code in specs; security notes documented (a mounted folder's
+  content is fully readable by guest code).
 
-### M5 — DX and operations
-CLI (`eval`, `build`, `doctor`), structured logs, optional telemetry, gem release, docs
-(`docs/SECURITY.md` with the threat model), benchmarks in CI.
+### Stage 6 — ImageBuilder and fingerprint-keyed caches (M3)
+
+- `ImageBuilder`: ruby version, `:full`/`:minimal` profile, stdlib allowlist,
+  pure-Ruby gems baked into the image.
+- Fingerprint-keyed image cache (`~/.cache/security_box/images/<sha>.wasm`) and
+  compiled-module cache identity; explicit build step (`rake security_box:build`,
+  `SecurityBox.build_all!`); `ImageMissing` when production forbids builds.
+
+### Stage 7 — CLI, docs, threat model (M5)
+
+- CLI `exe/security_box` (`eval`, `build`, `doctor`).
+- `docs/SECURITY.md` (threat model, incl. mounts), structured logs, optional
+  telemetry, benchmarks in CI (regression guard rail).
+
+### Backlog (revisit triggers)
+
+- Digest micro-optimization (sidecar manifest keyed by size+mtime) — only if
+  sub-100ms process boot becomes relevant (warm boot is ~0.56s, dominated by the
+  ~555ms image digest).
+- `:worker` mode — only when wasmtime-rb ships GVL-releasing/async WASI (stage 4 has
+  the probes and evidence).
+- `RactorPool` hardening: worker restart after a crash, `Ractor#monitor`/`join`-based
+  liveness instead of the pop deadline.
+- Pooling allocator — only if a pre-warming pool lands and RSS becomes a concern
+  (stage 3 Q3: no benefit for `:oneshot`).
+- Investigate: Ractor mode for `Sandbox`/`Pool` beyond the collector-thread contract
+  (Ractor-safe paths around `Runtime`/`ModuleCache` class memos).
 
 ---
 
 ## 10. Tests
 
-- **Escape matrix** (each item becomes a test that must yield a `Result`, never break the
-  host): `loop {}`, `until false`, `"a" * 10**12`, `eval("`ls`")`, `system("ls")`, `fork`,
-  `File.write("/etc/passwd")`, `Dir["/"]`, `ENV`, `require "socket"`, `require "open-uri"`,
-  `Thread.new`, `exit!`, `at_exit`, `Process.kill`, giant `Random`, hostile `Marshal.load`,
-  infinite recursion, `puts "x" * 10**9`, `String#*`, catastrophic `Regexp`, `$0`/`__FILE__`.
-- **Limits**: each exceeded limit produces the correct `status` and releases resources
-  (`store.close`).
-- **Configs**: `#with` does not mutate; equal fingerprints reuse the Runtime; different configs
-  are isolated; concurrent `spawn` on N threads with no memory leak.
-- **Benchmarks**: spawn latency p50/p99, throughput, memory per instance — guard rail in CI
-  (fails if it regresses > X%).
+Delivered:
+
+- **Escape matrix** (each item yields a `Result`, never breaks the host): `loop {}`,
+  `"a" * 10**12`, `system("ls")`, backticks, `IO.popen`, `fork`, `File.write("/etc/passwd")`,
+  `Dir["/*"]`, `ENV`, `require "socket"`, `Thread.new`, `exit!`, `at_exit` envelope
+  forgery, fake sentinel, giant allocations, deep recursion (backtrace cap), memory
+  bombs (`:memory_limit`), `Kernel#open` pipe form.
+- **Limits**: every exceeded limit produces the correct status and releases resources
+  (`store.close`); epoch precision, fuel exhaustion, memory floor, output truncation.
+- **Integrity**: token mismatch → `:sandbox_error`; envelope schema violations;
+  verified guest write beats a garbage overwrite.
+- **Configs**: `#with` never mutates; equal fingerprints share artifacts; profiles
+  never mutate; pool bounding/shutdown; Ractor concurrency + trap recovery.
+
+Stage 5 adds: read-only mount matrix (reads work, writes fail), collision matrix,
+`/work` coexistence with N mounts.
 
 ---
 
 ## 11. Risks and open questions
 
-1. **ruby.wasm instantiation cost** (the "full" image is large) — defines whether we need the
-   worker mode. Mitigation: precompiled module + pooling allocator + instance pool.
-2. **Image size** may make caching unfeasible in small containers — mitigate with the
-   `:minimal` profile + `stdlib` allowlist and removal of unused components.
-3. **FIFOs** in worker mode may hang on open in some platforms; Windows is out of scope for
-   the worker mode.
-4. **Version fidelity**: the guest Ruby is the one from ruby.wasm (4.0/3.4), not necessarily the
-   host one — document clearly and allow configuring per profile.
-5. **Return value serialization**: JSON is safe but limited (complex objects become
-   `String`/`nil`). Alternative: `Marshal` to a file in `/work` — but **never** deserialize on
-   the host; keep JSON in v1.
-6. **wasmtime traps** (`Wasmtime::Trap`) need to be mapped to `status` without leaking internal
-   runtime details in error messages.
-7. **Observability**: how to correlate executions (request id) — inject via guest env and
-   echo it in the envelope.
+1. **Boot on the hot path**: ~240ms ruby boot per eval; worker mode rejected. Real
+   parallelism only via `RactorPool` (~1.9x at 4 workers on 6 cores); horizontal
+   scaling via processes otherwise.
+2. **Image size** (110MB wasm + 139MB compiled cache): acceptable for server hosts;
+   the `:minimal` profile + stdlib allowlist (stage 6) mitigates for constrained
+   environments.
+3. **Version fidelity**: the guest Ruby is the ruby.wasm one (4.0), not the host's —
+   documented; configurable per profile in stage 6.
+4. **Return values**: JSON-only in v1; non-serializable objects surface as `inspect`
+   strings. Never introduce host-side `Marshal.load` of guest output.
+5. **Observability**: request-id correlation via guest env echoed in the envelope —
+   open, belongs with M5 (stage 7).
+6. **Mounts widen the trust surface** (stage 5): a mounted folder's content is fully
+   readable by guest code; read-only-by-default is the rule, and the threat model
+   (stage 7 `docs/SECURITY.md`) must spell out what a mount exposes.
+7. **Runtime dependency drift**: wasmtime-rb behavior (GVL, epoch semantics) is
+   version-pinned in evidence; re-run the stage 4 probes on any dependency bump.

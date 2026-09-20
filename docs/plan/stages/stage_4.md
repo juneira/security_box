@@ -192,12 +192,18 @@ No guest changes: the worker protocol never shipped, so no image repack was need
 
 ## 6. Pending items for Stage 5
 
-- [ ] M3: `ImageBuilder` (version, profile, stdlib components, gems allowlist) +
-      fingerprint-keyed image and compiled-module caches.
-- [ ] Digest micro-optimization (sidecar manifest keyed by size+mtime) if sub-100ms
-      process boot ever matters (unchanged from stage 2).
-- [ ] M5: CLI (`eval`, `build`, `doctor`), docs, `docs/SECURITY.md` threat model.
-- [ ] Revisit `:worker` mode when wasmtime-rb offers GVL-releasing or async WASI
-      (stage-4 Q1/Q2 has the full evidence and the probe scripts to re-run).
-- [ ] RactorPool hardening ideas (only if needed): worker restart after a crash,
-      `Ractor#monitor`/`join`-based liveness instead of the pop deadline.
+Redefined on 2026-09-20 (after stages 1–4): the roadmap moved from PLAN.md's
+original M0–M5 to the stage plan in `docs/PLAN.md` §9, which also reflects what
+shipped. The remaining scope, staged there:
+
+- **Stage 5** — folder mounts (read-only by default + `mount_rw`): the M2 leftover
+  that no stage had picked up (`c.mount`/`c.mount_rw` from PLAN.md §4).
+- **Stage 6** — M3: `ImageBuilder` (version, profile, stdlib components, gems
+  allowlist) + fingerprint-keyed image and compiled-module caches.
+- **Stage 7** — M5: CLI (`eval`, `build`, `doctor`), `docs/SECURITY.md` threat model,
+  benchmarks in CI.
+- **Backlog** — digest micro-optimization (sidecar manifest keyed by size+mtime) if
+  sub-100ms process boot ever matters; revisit `:worker` mode when wasmtime-rb offers
+  GVL-releasing or async WASI (stage-4 Q1/Q2 has the full evidence and the probe
+  scripts to re-run); `RactorPool` hardening (worker restart after a crash,
+  `Ractor#monitor`/`join`-based liveness instead of the pop deadline).
