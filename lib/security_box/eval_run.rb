@@ -10,7 +10,8 @@ module SecurityBox
   # and by RactorPool workers (one Ractor per worker) — both follow the same
   # protocol: sandbox-exclusive tmpdir mounted as /work, per-eval token via
   # ENV, envelope read back from /work/out.json (stdout sentinel fallback),
-  # fuel + epoch deadlines per evaluation.
+  # fuel + epoch deadlines per evaluation, and explicit read-only-by-default
+  # host-folder mounts (stage 5) validated per eval.
   #
   # Everything here is self-contained per call: no shared mutable state, safe
   # to run concurrently from multiple Ractors/threads as long as each caller
@@ -32,18 +33,28 @@ module SecurityBox
         stderr = +""
         t0 = monotonic_ms
 
+        # Mounts reference host paths that can disappear between building the
+        # configuration and this eval; fail here with a clear note instead of
+        # letting Wasmtime::Store.new raise an opaque error mid-setup.
+        mount_errors = mount_errors(config)
+        unless mount_errors.empty?
+          return Result.new(status: :sandbox_error, stderr: mount_errors.join("\n") << "\n",
+                            duration_ms: monotonic_ms - t0)
+        end
+
         Dir.mktmpdir("security_box") do |workdir|
           File.write(File.join(workdir, CODE_FILE), code)
           envelope = nil
           status = nil
           fuel_used = nil
 
-          store = Wasmtime::Store.new(
-            engine,
-            wasi_p1_config: build_wasi(workdir, stdout, stderr, config, token),
-            limits: { memory_size: config.memory_size }
-          )
+          store = nil
           begin
+            store = Wasmtime::Store.new(
+              engine,
+              wasi_p1_config: build_wasi(workdir, stdout, stderr, config, token),
+              limits: { memory_size: config.memory_size }
+            )
             store.set_fuel(config.effective_fuel)
             instance = linker.instantiate(store, module_)
             store.set_epoch_deadline(epoch_ticks(config))
@@ -56,7 +67,7 @@ module SecurityBox
             status = :sandbox_error
             stderr << "security_box: #{e.class}: #{e.message}\n"
           ensure
-            store.close
+            store&.close
           end
 
           build_result(status, envelope, stdout, stderr, fuel_used, monotonic_ms - t0)
@@ -66,13 +77,27 @@ module SecurityBox
       private
 
       def build_wasi(workdir, stdout, stderr, config, token)
-        Wasmtime::WasiConfig.new
-          .set_stdin_string("")
-          .set_stdout_buffer(stdout, config.stdout_limit)
-          .set_stderr_buffer(stderr, config.stderr_limit)
-          .set_argv(["ruby", GUEST_ENTRYPOINT])
-          .set_env(config.env.merge(TOKEN_ENV_VAR => token))
-          .set_mapped_directory(workdir, "/work", :read_write)
+        wasi = Wasmtime::WasiConfig.new
+                .set_stdin_string("")
+                .set_stdout_buffer(stdout, config.stdout_limit)
+                .set_stderr_buffer(stderr, config.stderr_limit)
+                .set_argv(["ruby", GUEST_ENTRYPOINT])
+                .set_env(config.env.merge(TOKEN_ENV_VAR => token))
+                .set_mapped_directory(workdir, "/work", :read_write)
+        # Explicit mounts come after /work; Configuration validation already
+        # guarantees no guest-path overlap with /work, /usr or /src.
+        config.mounts.reduce(wasi) do |wasi_config, mount|
+          wasi_config.set_mapped_directory(mount[:host], mount[:guest], mount[:mode])
+        end
+      end
+
+      # Host-side mount validation for this eval (configuration-level shape
+      # and collision rules are enforced in Configuration::Mounts).
+      def mount_errors(config)
+        config.mounts.reject { |mount| File.directory?(mount[:host]) }.map do |mount|
+          "security_box: mount #{mount[:host].inspect} (guest #{mount[:guest].inspect}): " \
+            "host path does not exist or is not a directory"
+        end
       end
 
       def epoch_ticks(config)

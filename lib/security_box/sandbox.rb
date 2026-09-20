@@ -24,7 +24,8 @@ module SecurityBox
 
     # Runs `code` in the sandbox and returns a Result.
     # Per-call options (derived from the configuration without mutating it):
-    #   timeout_ms:, fuel:, fuel_ms:, memory_size:, stdout_limit:, stderr_limit:
+    #   timeout_ms:, fuel:, fuel_ms:, memory_size:, stdout_limit:, stderr_limit:,
+    #   mounts: (replaces the configuration's mounts, like env:)
     def eval(code, **overrides)
       raise ArgumentError, "code is required" if code.nil? || code.empty?
 

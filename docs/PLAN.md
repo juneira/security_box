@@ -1,10 +1,10 @@
 # Plan: `security_box` — sandbox for untrusted Ruby with ruby.wasm + wasmtime
 
-> **Status**: stages 1–4 are delivered and shipped as gem releases 0.1.0–0.4.0.
+> **Status**: stages 1–5 are delivered and shipped as gem releases 0.1.0–0.5.0.
 > This document reflects what actually shipped; the measured evidence lives in the
 > stage documents (`docs/plan/stages/`). The roadmap in §9 carries the remaining
-> scope: stage 5 (folder mounts) is next, followed by the image builder (M3) and
-> the CLI (M5), with a backlog of revisit triggers.
+> scope: the image builder (M3, stage 6) and the CLI (M5, stage 7), with a backlog
+> of revisit triggers.
 
 ## 1. Goal
 
@@ -45,7 +45,8 @@ Core requirements:
   entrypoint + hardening prelude into a single self-contained `.wasm` with an embedded
   VFS (`rbwasm pack`; `/usr` and `/src` are embedded, read-only to the guest).
 - Per `#eval` (`:oneshot`, the only mode): the host creates a sandbox-exclusive tmpdir,
-  writes the user code to it, mounts it read-write as `/work`, generates a per-eval
+  writes the user code to it, mounts it read-write as `/work`, applies the explicit
+  configuration mounts (read-only by default; validated per eval), generates a per-eval
   random token delivered via `SB_TOKEN`, then boots a fresh wasm instance:
 
 ```ruby
@@ -61,6 +62,7 @@ wasi = Wasmtime::WasiConfig.new
   .set_argv(["ruby", "/src/main.rb"])
   .set_env(config.env.merge("SB_TOKEN" => token))
   .set_mapped_directory(workdir, "/work", :read_write)
+config.mounts.each { |m| wasi.set_mapped_directory(m[:host], m[:guest], m[:mode]) }
 
 store = Wasmtime::Store.new(engine, wasi_p1_config: wasi,
                             limits: { memory_size: config.memory_size })
@@ -102,11 +104,11 @@ Configuration (immutable, #with, fingerprint, fuel_ms) ──► Registry (named
 
 | Layer | Responsibility |
 |---|---|
-| `Configuration` | Immutable; Builder DSL, `#with`, `#fingerprint`, `fuel_ms` → `#effective_fuel`. |
+| `Configuration` | Immutable; Builder DSL, `#with`, `#fingerprint`, `fuel_ms` → `#effective_fuel`, validated `mounts`. |
 | `Registry` | Named profiles (`register`/`resolve`); profiles never mutate. |
 | `ModuleCache` | Content-addressed `.cwasm` disk cache (best effort, atomic writes). |
 | `Runtime` | `Engine` cache per `epoch_interval_ms`, compiled `Module` per `(engine, image_path)`; `build_shareable` for Ractor pools. |
-| `EvalRun` | One `:oneshot` evaluation: WASI config, limits, invoke, trap mapping, envelope read. Shared by `Sandbox` and Ractor workers. |
+| `EvalRun` | One `:oneshot` evaluation: WASI config (incl. mounts), limits, invoke, trap mapping, envelope read. Shared by `Sandbox` and Ractor workers. |
 | `Sandbox` | Thin, thread-safe wrapper over `EvalRun`. |
 | `Envelope` | Host-side schema + token validation (forged results → `:sandbox_error`). |
 | `Result` | `status`, `value`, `error` (with `backtrace`), `stdout`, `stderr`, `fuel_used`, `duration_ms`, `guest_duration_ms`. |
@@ -124,34 +126,29 @@ SecurityBox.warmup                                  # pre-build Engine + Module 
 sandbox = SecurityBox::Sandbox.new(config)
 sandbox.eval(code, timeout_ms: 500)                 # per-call overrides, profile unchanged
 
-SecurityBox.register(:lean, from: :default) do |c|
+SecurityBox.register(:reader) do |c|
   c.fuel 2_000_000_000                              # or c.fuel_ms 200 (rate-based)
+  c.mount    "./data" => "/data"                    # read-only mount (default)
+  c.mount_rw "./state" => "/state"                  # opt-in writable mount
   c.timeout_ms 500
 end
-box = SecurityBox.spawn(:lean)                      # Sandbox from a profile
-SecurityBox.spawn(:lean, fuel: 1_000)               # per-call override via #with
+box = SecurityBox.spawn(:reader)                    # Sandbox from a profile
+SecurityBox.spawn(:reader, timeout_ms: 100)         # per-call override via #with
+SecurityBox.eval(code, mounts: [...])               # per-call mounts override (replaces)
 
-pool = SecurityBox.pool(:lean, size: 4)             # bounded concurrency (GVL-serial)
+pool = SecurityBox.pool(:reader, size: 4)           # bounded concurrency (GVL-serial)
 pool.eval(code); pool.metrics; pool.shutdown
-rpool = SecurityBox.ractor_pool(:lean, size: 4)     # real parallelism (worker Ractors)
+rpool = SecurityBox.ractor_pool(:reader, size: 4)   # real parallelism (worker Ractors)
 rpool.eval(code); rpool.shutdown
 
 config = SecurityBox::Configuration.build(
   fuel: ..., fuel_ms: ..., timeout_ms:, memory_size:,
-  stdout_limit:, stderr_limit:, epoch_interval_ms:, env:
+  stdout_limit:, stderr_limit:, epoch_interval_ms:, env:, mounts:
 )
 config.with(**changes)      # derived copy
 config.fingerprint          # stable identity (SHA-256 of the canonical hash)
 config.effective_fuel       # fuel_ms-aware (4e6 fuel/ms + ~1e9 boot allowance)
-```
-
-Pending API (stage 5 — folder mounts, the M2 leftover):
-
-```ruby
-SecurityBox.register(:reader) do |c|
-  c.mount    "./data" => "/data"   # read-only by default
-  c.mount_rw nil                   # nothing writable outside /work
-end
+config.mounts               # frozen array of frozen {host:, guest:, mode:} hashes
 ```
 
 ---
@@ -165,15 +162,16 @@ end
 | Stack overflow / recursion | rescued in the guest (`SystemStackError` → `:error` envelope) |
 | Host disk/RAM exhaustion | `Pool` hard cap on concurrent evals; `store.close` on every teardown |
 | Network | WASI p1 has no sockets (`require "socket"` → `LoadError`) |
-| Host filesystem | No pre-opened directories: only the sandbox-exclusive `/work` tmpdir (rw). Explicit folder mounts arrive in stage 5 — read-only by default |
+| Host filesystem | No pre-opened directories beyond the sandbox-exclusive `/work` tmpdir (rw). Explicit mounts (`c.mount`/`c.mount_rw`, stage 5) are validated at registration (normalized absolute guest paths, no overlap with `/work`/`/usr`/`/src`, unique, ≤16) and re-checked per eval (host dir must exist); read-only mode is wasmtime-enforced (`Errno::EPERM` on writes), and symlinks inside a mount cannot escape the preopen root |
 | Processes / `system` / backticks / fork | Nonexistent in wasip1; the hardening prelude also neutralizes `system`, `exec`, `Kernel#spawn`, backticks, `IO.popen`, `Process.spawn`, `Kernel#open` (all raise `SecurityError`) |
 | stdout flood | `set_stdout_buffer(buf, capacity)` truncates at the configured limit |
 | ENV/argv leak | `set_env` only carries allowed variables + the per-eval token; the prelude captures `SB_TOKEN` and scrubs `ENV` before user code runs |
 | Forged results | Token-validated envelope (`/work/out.json` + sentinel fallback); strict schema validation; guest verifies its own envelope write; forged results → `:sandbox_error` |
 
 **Primary isolation is WASI + the wasm runtime; the prelude is defense in depth.**
-Optional prelude refinement (stage 5 decision): restrict guest `File` write operations
-when there is no writable mount — candidate defense-in-depth for the mounts milestone.
+Stage-5 probe evidence: the embedded VFS (`/usr`, `/src`) is not guest-writable and
+symlink creation is not supported, so the prelude needs no File-write restriction
+(the Q6 refinement was considered and rejected on evidence).
 
 ---
 
@@ -215,7 +213,9 @@ Delivered:
   Builder DSL collects only changed values; `env` replaces (not merges).
 - `#fingerprint`: SHA-256 of the canonical configuration — equal settings produce
   equal fingerprints; ready for cache identity (used by profile identity/diagnostics;
-  artifact keying lands with the ImageBuilder).
+  artifact keying lands with the ImageBuilder). Mounts are config values and feed the
+  fingerprint automatically (host paths are expanded at DSL time, so the fingerprint
+  is stable per resolved location).
 - Runtime sharing: engines are memoized per `epoch_interval_ms`, compiled modules per
   `(engine, image_path)`; the `.cwasm` disk cache is content-addressed (image digest +
   `precompile_compatibility_key`), so a new process boots the runtime in ~0.5s
@@ -234,7 +234,7 @@ build becomes an explicit step (`SecurityBox.build_all!` / rake), with
 
 ```
 lib/security_box.rb                       # eval/warmup/register/spawn/pool/ractor_pool
-lib/security_box/configuration.rb         # immutable + Builder DSL + #with + fingerprint + fuel_ms
+lib/security_box/configuration.rb         # immutable + Builder DSL + #with + fingerprint + fuel_ms + Mounts
 lib/security_box/registry.rb              # named profiles (register/resolve/profiles/clear!)
 lib/security_box/module_cache.rb          # content-addressed .cwasm disk cache
 lib/security_box/runtime.rb               # Engine cache + compiled Module + build_shareable
@@ -264,7 +264,7 @@ Dependencies: `wasmtime` (runtime), `ruby_wasm` (build only), `json` (stdlib).
 
 ## 9. Roadmap
 
-### Delivered — stages 1–4
+### Delivered — stages 1–5
 
 | Stage | Focus | Outcome (see stage doc) |
 |---|---|---|
@@ -272,25 +272,7 @@ Dependencies: `wasmtime` (runtime), `ruby_wasm` (build only), `json` (stdlib).
 | 2 (0.2.0) | Hardening + cold-boot | Token channel + envelope validation, hardening prelude, `.cwasm` disk cache (~15.6s → ~0.56s warm boot) |
 | 3 (0.3.0) | Profiles + calibration | `register`/`spawn`, `#fingerprint`, Ractor shareability evidence, memory floor, fuel calibration table, guest backtrace, verified envelope write |
 | 4 (0.4.0) | Concurrency | `:worker` mode rejected (GVL evidence), `Pool` + `RactorPool` (~1.9x at 4 workers), `fuel_ms`, `EvalRun` extraction |
-
-### Stage 5 — Folder mounts (next; completes the M2 leftover)
-
-Mount host folders into the sandbox explicitly, read-only by default, so guest code
-can safely read a host directory.
-
-- `Configuration` DSL: `c.mount "host/path" => "/data"` (read-only) and `c.mount_rw`
-  (opt-in writable, nothing outside `/work` by default).
-- `EvalRun`: apply mounts via `set_mapped_directory` after `/work`; host-side
-  validation (absolute existing paths, guest-path collisions with `/work`/`/usr`/
-  `/src`, duplicates, mount count).
-- Behavior probes: read-only mount write failures (`Errno::EROFS` or equivalent),
-  coexistence/shadowing with the embedded VFS (stage 1 proved one mount; validate N),
-  per-eval cost.
-- Decision needed: prelude File-write restriction when no RW mount exists
-  (defense in depth).
-- Exit criterion: read-only + RW mount matrix green against the real image; mounted
-  content read by guest code in specs; security notes documented (a mounted folder's
-  content is fully readable by guest code).
+| 5 (0.5.0) | Folder mounts | `c.mount`/`c.mount_rw` (read-only by default), validation matrix, wasmtime-enforced RO (`EPERM`), symlink escapes blocked, embedded VFS not guest-writable (no prelude change), mount cost ~0 |
 
 ### Stage 6 — ImageBuilder and fingerprint-keyed caches (M3)
 
@@ -338,8 +320,14 @@ Delivered:
 - **Configs**: `#with` never mutates; equal fingerprints share artifacts; profiles
   never mutate; pool bounding/shutdown; Ractor concurrency + trap recovery.
 
-Stage 5 adds: read-only mount matrix (reads work, writes fail), collision matrix,
-`/work` coexistence with N mounts.
+**Mount matrix (stage 5)**: reads work through a read-only mount (`File.read`,
+`Dir[]`, `File.open`, nested dirs) while writes fail with `Errno::EPERM` and the host
+directory is untouched; `mount_rw` round-trips (host sees guest-written files);
+`/work` + stdlib + N mounts coexist; registration rejects reserved overlaps
+(`/work`, `/usr`, `/src`, exact or nested), duplicate guest paths, >16 mounts,
+unknown modes and unnormalized guest paths; a vanished host directory maps to
+`:sandbox_error` with a `security_box:` note; profile plumbing (`register`/`spawn`)
+and a RactorPool eval carry mounts end to end.
 
 ---
 
@@ -357,8 +345,9 @@ Stage 5 adds: read-only mount matrix (reads work, writes fail), collision matrix
    strings. Never introduce host-side `Marshal.load` of guest output.
 5. **Observability**: request-id correlation via guest env echoed in the envelope —
    open, belongs with M5 (stage 7).
-6. **Mounts widen the trust surface** (stage 5): a mounted folder's content is fully
-   readable by guest code; read-only-by-default is the rule, and the threat model
-   (stage 7 `docs/SECURITY.md`) must spell out what a mount exposes.
+6. **Mounts widen the trust surface** (stage 5, delivered): a mounted folder's content
+   is fully readable by guest code; read-only is wasmtime-enforced (`Errno::EPERM`),
+   and nothing outside `/work` is writable without an explicit `mount_rw`. The threat
+   model (stage 7 `docs/SECURITY.md`) must spell out what a mount exposes.
 7. **Runtime dependency drift**: wasmtime-rb behavior (GVL, epoch semantics) is
    version-pinned in evidence; re-run the stage 4 probes on any dependency bump.

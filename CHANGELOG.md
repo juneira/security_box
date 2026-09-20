@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-20
+
+### Added
+
+- Folder mounts (read-only by default): `c.mount "host/path" => "/data"` in the
+  register DSL (or `mounts:` in `Configuration.build`), with `c.mount_rw` for an
+  opt-in writable mount. Guest code can read a mounted host directory
+  (`File.read`, `Dir[]`, `File.open`); write attempts into a read-only mount fail
+  guest-side with `Errno::EPERM` and leave the host directory untouched.
+- `Configuration#mounts`: a frozen array of frozen `{host:, guest:, mode:}` hashes.
+  Mounts are config values — they flow through `#with`, `#fingerprint` (equal
+  mounts → equal fingerprint) and RactorPool requests. Relative host paths are
+  expanded against `Dir.pwd` at DSL time.
+- Mount validation (`SecurityBox::InvalidConfiguration` on violation): mode must be
+  `:read_only`/`:read_write` (wasmtime silently accepts unknown symbols, so the mode
+  is never trusted to the runtime); guest paths must be absolute and normalized
+  (no `..`, no trailing `/`, not `/`); guest paths must not overlap the reserved
+  `/work`, `/usr` or `/src` trees (exact or nested — a collision with the embedded
+  VFS is silently shadowed, a mount inside `/usr` breaks the guest boot, and inside
+  `/work` it would create a read-only subtree); duplicate guest paths are rejected
+  (wasmtime's last-mount-wins is silently surprising); at most 16 mounts.
+- Per-eval host-path validation: a mount whose host directory vanished returns a
+  `:sandbox_error` Result with a `security_box:` note instead of raising
+  `Wasmtime::Error` out of `#eval` (the store creation now also sits inside the
+  eval's rescue, so wasmtime setup failures can never raise).
+
+### Changed
+
+- `Sandbox#eval` (and pool equivalents) accept `mounts:` as a per-call override
+  (replaces the configuration's mounts, like `env:`).
+- README: new "Folder mounts" section + updated isolation matrix and defense notes
+  (a mounted folder's content is fully readable by guest code).
+
+### Investigation (no change needed, documented)
+
+- Q6 probe (stage 5): the embedded VFS is **not** guest-writable (`File.write`
+  into `/usr`, `/src` or `/` fails with `Errno::ENOENT`; deletes with `ENOTSUP`),
+  so no prelude File-write restriction is warranted; WASI remains the primary
+  enforcement. Symlink escapes from a mounted directory are blocked by wasmtime
+  (`Errno::EPERM`); the guest cannot even create symlinks. Measured mount cost:
+  none (warm-boot p50 ~260ms with 0/1/4/8 mounts). Evidence and probes in
+  `docs/plan/stages/stage_5.md` and `bin/spike_stage5_mounts.rb`.
+
 ## [0.4.0] - 2026-09-15
 
 ### Added

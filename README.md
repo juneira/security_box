@@ -119,7 +119,8 @@ sandbox.eval("3 * 3").value # => 9
 ### Per-call limits
 
 Options can be passed per call (derived from the configuration without mutating it):
-`timeout_ms`, `fuel`, `fuel_ms`, `memory_size`, `stdout_limit`, `stderr_limit`.
+`timeout_ms`, `fuel`, `fuel_ms`, `memory_size`, `stdout_limit`, `stderr_limit`,
+`mounts`.
 
 ```ruby
 # Wall-clock limit via epoch interruption
@@ -182,6 +183,49 @@ Profiles are immutable: duplicate names and unknown names raise
 `SecurityBox::Configuration#fingerprint` gives every configuration a stable
 identity (equal settings → equal fingerprint), used to share runtime artifacts.
 
+### Folder mounts
+
+Host folders can be mounted into the sandbox explicitly. **Mounts are read-only
+by default**; `mount_rw` is the opt-in writable form:
+
+```ruby
+SecurityBox.register(:reader) do |c|
+  c.mount    "./data" => "/data"   # read-only (host path expanded at DSL time)
+  c.mount_rw "./state" => "/state" # opt-in writable
+end
+
+box = SecurityBox.spawn(:reader)
+box.eval('File.read("/data/input.csv")')      # guest reads mounted content
+box.eval('File.write("/state/last.txt", Time.now.to_i)')
+
+# Per-call override (replaces the configuration's mounts, like env:)
+SecurityBox.eval('File.read("/data/a.txt")',
+                 mounts: [{ host: "./data", guest: "/data", mode: :read_only }])
+```
+
+Rules (violations raise `SecurityBox::InvalidConfiguration` at registration):
+
+- A mount is one `{host:, guest:, mode:}` pair; `mode` is `:read_only` or
+  `:read_write` and the DSL defaults to read-only.
+- Guest paths must be absolute and normalized, must not overlap the reserved
+  `/work` (sandbox tmpdir), `/usr` (embedded stdlib) or `/src` (entrypoint)
+  trees — exact or nested — and must be unique.
+- At most 16 mounts per configuration.
+- The host path must exist and be a directory at eval time; otherwise the eval
+  returns `:sandbox_error` with a `security_box:` note on stderr (instead of
+  raising).
+
+Security notes:
+
+- **A mounted folder's content is fully readable by guest code** — only mount
+  directories whose content you are willing to expose to the executed code.
+- Read-only mounts are enforced by wasmtime: writes fail guest-side with
+  `Errno::EPERM` and the host directory is never touched. Symlinks inside a
+  mounted directory cannot escape it (wasmtime caps path resolution at the
+  preopen root), and guest code cannot create symlinks at all.
+- Mounted content can also be **written by the guest** in `mount_rw` mounts —
+  treat a writable mount as part of the guest's blast radius.
+
 ### Configuration
 
 `SecurityBox::Configuration` is immutable; use `.build` to create and `#with` to derive:
@@ -195,7 +239,8 @@ config = SecurityBox::Configuration.build(
   stdout_limit: 1 << 20,            # stdout capture capacity in bytes
   stderr_limit: 1 << 16,            # stderr capture capacity in bytes
   epoch_interval_ms: 25,            # epoch timer granularity
-  env: { "LANG" => "C" }            # guest environment (empty by default)
+  env: { "LANG" => "C" },           # guest environment (empty by default)
+  mounts: []                        # host-folder mounts (see "Folder mounts")
 )
 
 lean = config.with(timeout_ms: 500, fuel: 5_000_000)
@@ -222,6 +267,8 @@ string.
 |---|---|
 | `File.write("/etc/passwd", ...)` | `Errno::ENOENT` (guest does not see the host FS) |
 | `Dir["/*"]` | `[]` (empty root) |
+| `File.write` into a read-only mount | `Errno::EPERM` (wasmtime-enforced; host dir untouched) |
+| symlink escape from a mounted directory | `Errno::EPERM` (path resolution capped at the preopen root) |
 | `system("ls")` / backticks / `IO.popen` / `Process.spawn` | `SecurityError` (hardening prelude) |
 | `Kernel#open(...)` | `SecurityError` (pipe form; use `File.open`) |
 | `fork` | `NotImplementedError` |
@@ -234,6 +281,9 @@ string.
 Notes:
 
 - The guest Ruby version is the one from ruby.wasm (4.0), not necessarily the host's.
+- Mounts widen the trust surface: a mounted folder's content is fully readable by
+  guest code (see "Folder mounts" above). Read-only by default; nothing outside
+  `/work` is writable without an explicit `mount_rw`.
 - Concurrency: `invoke` holds the GVL, so executions on threads serialize — use
   `RactorPool` (below) for parallelism inside one process, or scale horizontally with
   multiple processes (e.g., Puma workers). A stuck guest still can't hang the process
@@ -338,3 +388,5 @@ bundle exec ruby bin/spike.rb
   parallelism, memory floor, fuel calibration, backtrace)
 - `docs/plan/stages/stage_4.md` — stage 4 findings (worker-mode feasibility, pools,
   `fuel_ms`)
+- `docs/plan/stages/stage_5.md` — stage 5 findings (folder mounts: read-only
+  enforcement, reserved-path collisions, symlink escapes, mount cost)

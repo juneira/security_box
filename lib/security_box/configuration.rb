@@ -19,7 +19,8 @@ module SecurityBox
       stdout_limit: 1 << 20,
       stderr_limit: 1 << 16,
       epoch_interval_ms: 25,
-      env: {}.freeze
+      env: {}.freeze,
+      mounts: [].freeze
     }.freeze
 
     # Fuel-per-ms conversion for #fuel_ms, from the stage-3 calibration table
@@ -30,14 +31,14 @@ module SecurityBox
     BOOT_FUEL_ALLOWANCE = 1_000_000_000
 
     attr_reader :image_path, :fuel, :fuel_ms, :timeout_ms, :memory_size,
-                :stdout_limit, :stderr_limit, :epoch_interval_ms, :env
+                :stdout_limit, :stderr_limit, :epoch_interval_ms, :env, :mounts
 
     def self.build(**options)
       new(**DEFAULTS.merge(options)).freeze
     end
 
     def initialize(image_path: nil, fuel:, fuel_ms:, timeout_ms:, memory_size:,
-                   stdout_limit:, stderr_limit:, epoch_interval_ms:, env:)
+                   stdout_limit:, stderr_limit:, epoch_interval_ms:, env:, mounts:)
       @image_path = image_path || default_image_path
       @fuel = Integer(fuel)
       @fuel_ms = fuel_ms.nil? ? nil : Integer(fuel_ms)
@@ -47,6 +48,7 @@ module SecurityBox
       @stderr_limit = Integer(stderr_limit)
       @epoch_interval_ms = Integer(epoch_interval_ms)
       @env = env.freeze
+      @mounts = Mounts.normalize(mounts)
       freeze
     end
 
@@ -88,7 +90,8 @@ module SecurityBox
         stdout_limit: @stdout_limit,
         stderr_limit: @stderr_limit,
         epoch_interval_ms: @epoch_interval_ms,
-        env: @env
+        env: @env,
+        mounts: @mounts
       }
     end
 
@@ -159,6 +162,32 @@ module SecurityBox
       def env(value)
         @changes[:env] = value
       end
+
+      # Mounts a host directory into the guest, read-only by default:
+      #   c.mount "host/path" => "/data"
+      # Each call appends one mount; use #mount_rw for a writable mount.
+      def mount(mapping)
+        add_mount(mapping, :read_only)
+      end
+
+      # Opt-in writable mount — the only way to expose a writable host path
+      # besides the sandbox-private /work tmpdir:
+      #   c.mount_rw "host/path" => "/data"
+      def mount_rw(mapping)
+        add_mount(mapping, :read_write)
+      end
+
+      private
+
+      def add_mount(mapping, mode)
+        unless mapping.is_a?(Hash) && mapping.size == 1
+          raise InvalidConfiguration,
+                'mount expects exactly one pair: c.mount "host/path" => "/data"'
+        end
+
+        host, guest = mapping.first
+        @changes[:mounts] = Array(@changes[:mounts]) + [{ host: host, guest: guest, mode: mode }]
+      end
     end
 
     private
@@ -178,6 +207,119 @@ module SecurityBox
             "Sandbox image not found. Tried: #{candidates.join(', ')}. " \
             "Run `rake security_box:build_image`, set #{IMAGE_ENV_VAR}, " \
             "or pass image_path in the configuration."
+    end
+  end
+
+  # Validated collection of host-folder mounts (stage 5). A mount is a frozen
+  # {host:, guest:, mode:} hash; `mounts` in a Configuration is a frozen array
+  # of these, so the value survives #with, #fingerprint and Ractor ports.
+  #
+  # Validation (InvalidConfiguration on any violation):
+  #   - mode is :read_only or :read_write (wasmtime silently accepts unknown
+  #     symbols, so the mode is checked here, never trusted to the runtime)
+  #   - host: non-empty string; relative paths are expanded against Dir.pwd
+  #     (existence/directory checks are per-eval, in EvalRun — dirs can vanish)
+  #   - guest: absolute, normalized path (no "..", no trailing slash), not "/"
+  #   - guest paths must not overlap /work, /usr or /src (exact or nested):
+  #     a collision with the embedded VFS is silently shadowed (stage-5 spike:
+  #     the mount content is invisible), a mount inside /usr even breaks the
+  #     guest boot, and inside /work it would create a read-only subtree
+  #   - duplicate guest paths are rejected (wasmtime's last-mount-wins is
+  #     silently surprising)
+  #   - at most MAX_MOUNTS mounts
+  module Mounts
+    MODES = %i[read_only read_write].freeze
+    RESERVED_GUEST_PATHS = %w[/work /usr /src].freeze
+    MAX_MOUNTS = 16
+
+    class << self
+      # Validates + normalizes `raw` (an array of {host:, guest:, mode:} hashes
+      # or nil) and returns a frozen array of frozen, normalized hashes.
+      def normalize(raw)
+        return [].freeze if raw.nil?
+
+        raise InvalidConfiguration,
+              "mounts must be an Array of {host:, guest:, mode:} hashes, got #{raw.class}" unless raw.is_a?(Array)
+
+        mounts = raw.map { |entry| normalize_entry(entry) }
+        check_duplicates(mounts)
+        check_reserved(mounts)
+        check_count(mounts)
+        mounts.freeze
+      end
+
+      private
+
+      def normalize_entry(entry)
+        unless entry.is_a?(Hash) && entry.keys.sort == %i[guest host mode]
+          raise InvalidConfiguration,
+                "each mount must be a Hash with exactly :host, :guest and :mode keys, got #{entry.inspect}"
+        end
+
+        mode = entry[:mode]
+        unless MODES.include?(mode)
+          raise InvalidConfiguration,
+                "mount mode must be one of #{MODES.map(&:inspect).join(' or ')}, got #{mode.inspect}"
+        end
+
+        { host: normalize_host(entry[:host]),
+          guest: normalize_guest(entry[:guest]),
+          mode: mode }.freeze
+      end
+
+      def normalize_host(host)
+        unless host.is_a?(String) && !host.empty?
+          raise InvalidConfiguration, "mount host path must be a non-empty String, got #{host.inspect}"
+        end
+
+        File.expand_path(host).freeze
+      end
+
+      def normalize_guest(guest)
+        unless guest.is_a?(String) && !guest.empty?
+          raise InvalidConfiguration, "mount guest path must be a non-empty String, got #{guest.inspect}"
+        end
+        unless guest.start_with?("/")
+          raise InvalidConfiguration, "mount guest path must be absolute, got #{guest.inspect}"
+        end
+
+        guest = guest.chomp("/")
+        if guest.empty? || File.expand_path(guest, "/") != guest
+          raise InvalidConfiguration,
+                "mount guest path must be a normalized absolute path (no '..', '.' or trailing '/'), got #{guest.inspect}"
+        end
+        raise InvalidConfiguration, "mount guest path contains a NUL byte" if guest.include?("\0")
+
+        guest.freeze
+      end
+
+      def check_duplicates(mounts)
+        guests = mounts.map { |mount| mount[:guest] }
+        duplicate = guests.find { |guest| guests.count(guest) > 1 }
+        return unless duplicate
+
+        raise InvalidConfiguration, "duplicate guest mount path #{duplicate.inspect}"
+      end
+
+      def check_reserved(mounts)
+        mounts.each do |mount|
+          guest = mount[:guest]
+          conflict = RESERVED_GUEST_PATHS.find do |reserved|
+            guest == reserved || guest.start_with?("#{reserved}/") || reserved.start_with?("#{guest}/")
+          end
+          next unless conflict
+
+          raise InvalidConfiguration,
+                "mount guest path #{guest.inspect} overlaps the reserved path #{conflict.inspect}"
+        end
+      end
+
+      def check_count(mounts)
+        return if mounts.size <= MAX_MOUNTS
+
+        raise InvalidConfiguration,
+              "too many mounts (#{mounts.size}); the limit is #{MAX_MOUNTS}"
+      end
     end
   end
 end
