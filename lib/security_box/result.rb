@@ -8,12 +8,17 @@ module SecurityBox
   #   :fuel_exhausted — CPU budget exhausted
   #   :memory_limit   — exceeded the store memory_size
   #   :sandbox_error  — sandbox failure (unexpected trap, missing/invalid envelope)
+  #
+  # `rpcs` (stage 6): the host-side transcript of guest RPC calls, one
+  # frozen {"name", "args", "ok", "result"|"error"} entry per call, or nil
+  # when no rpcs were configured (or none were called).
   class Result
     attr_reader :status, :value, :error, :stdout, :stderr,
-                :fuel_used, :duration_ms, :guest_duration_ms
+                :fuel_used, :duration_ms, :guest_duration_ms, :rpcs
 
     def initialize(status:, value: nil, error: nil, stdout: "", stderr: "",
-                   fuel_used: nil, duration_ms: nil, guest_duration_ms: nil)
+                   fuel_used: nil, duration_ms: nil, guest_duration_ms: nil,
+                   rpcs: nil)
       @status = status
       @value = value
       @error = error
@@ -22,6 +27,7 @@ module SecurityBox
       @fuel_used = fuel_used
       @duration_ms = duration_ms
       @guest_duration_ms = guest_duration_ms
+      @rpcs = rpcs
       freeze
     end
 
@@ -45,7 +51,8 @@ module SecurityBox
         stderr: @stderr,
         fuel_used: @fuel_used,
         duration_ms: @duration_ms,
-        guest_duration_ms: @guest_duration_ms
+        guest_duration_ms: @guest_duration_ms,
+        rpcs: @rpcs
       }
     end
   end

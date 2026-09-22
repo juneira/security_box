@@ -43,6 +43,10 @@ module SecurityBox
       @linker_mutex.synchronize do
         @linker ||= Wasmtime::Linker.new(@engine).tap do |linker|
           Wasmtime::WASI::P1.add_to_linker_sync(linker)
+          # The image statically links the sb_rpc extension, so the
+          # "sb"/"call" import must be defined even when no rpcs are
+          # configured (state is per-Store; see GuestRpc).
+          GuestRpc.define_import(linker)
         end
       end
     end

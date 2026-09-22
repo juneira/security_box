@@ -105,20 +105,21 @@ RSpec.describe SecurityBox::Sandbox do
       end
 
       it "maps a guest NoMemoryError to :memory_limit" do
-        # 128MB boots but is too small for a 1MB buffer workload: the Ruby
-        # interpreter raises NoMemoryError before the wasm limit is reached.
+        # 64MB boots (floor ~36MiB on the stage-6 image) but is too small
+        # for a 1MB buffer workload: the Ruby interpreter raises
+        # NoMemoryError before the wasm limit is reached.
         result = sandbox.eval(
           'buf = +""; 1024.times { buf << ("x" * 1024) }; buf.bytesize',
-          memory_size: 128 * 1024 * 1024, timeout_ms: 15_000
+          memory_size: 64 * 1024 * 1024, timeout_ms: 15_000
         )
 
         expect(result.status).to eq(:memory_limit)
       end
 
       it "returns :sandbox_error (never raises) below the module memory floor" do
-        # The packed module declares 1528 pages (~95.5MiB) minimum; below
-        # that instantiation fails before the guest boots.
-        result = sandbox.eval("1", memory_size: 64 * 1024 * 1024)
+        # The stage-6 image (rbwasm build) declares ~576 pages (~36MiB)
+        # minimum; below that instantiation fails before the guest boots.
+        result = sandbox.eval("1", memory_size: 32 * 1024 * 1024)
 
         expect(result.status).to eq(:sandbox_error)
         expect(result.value).to be_nil

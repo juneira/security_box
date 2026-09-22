@@ -16,7 +16,6 @@ require_relative "prelude"
 module SB
   SENTINEL = "__SECURITY_BOX_RESULT__"
   WORK_DIR = "/work"
-
   module_function
 
   def run
@@ -96,5 +95,9 @@ module SB
     emit({ ok: false, value: nil, error: { "class" => "SecurityBox::Guest", "message" => message } }, token)
   end
 end
+
+# Guest RPC bridge (SB.call + SB::ToolError) — reopens the SB module
+# above; must load after it.
+require_relative "rpc"
 
 SB.run

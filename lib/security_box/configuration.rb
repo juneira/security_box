@@ -20,7 +20,8 @@ module SecurityBox
       stderr_limit: 1 << 16,
       epoch_interval_ms: 25,
       env: {}.freeze,
-      mounts: [].freeze
+      mounts: [].freeze,
+      rpcs: {}.freeze
     }.freeze
 
     # Fuel-per-ms conversion for #fuel_ms, from the stage-3 calibration table
@@ -31,14 +32,16 @@ module SecurityBox
     BOOT_FUEL_ALLOWANCE = 1_000_000_000
 
     attr_reader :image_path, :fuel, :fuel_ms, :timeout_ms, :memory_size,
-                :stdout_limit, :stderr_limit, :epoch_interval_ms, :env, :mounts
+                :stdout_limit, :stderr_limit, :epoch_interval_ms, :env, :mounts,
+                :rpcs
 
     def self.build(**options)
       new(**DEFAULTS.merge(options)).freeze
     end
 
     def initialize(image_path: nil, fuel:, fuel_ms:, timeout_ms:, memory_size:,
-                   stdout_limit:, stderr_limit:, epoch_interval_ms:, env:, mounts:)
+                   stdout_limit:, stderr_limit:, epoch_interval_ms:, env:, mounts:,
+                   rpcs:)
       @image_path = image_path || default_image_path
       @fuel = Integer(fuel)
       @fuel_ms = fuel_ms.nil? ? nil : Integer(fuel_ms)
@@ -49,6 +52,7 @@ module SecurityBox
       @epoch_interval_ms = Integer(epoch_interval_ms)
       @env = env.freeze
       @mounts = Mounts.normalize(mounts)
+      @rpcs = Rpcs.normalize(rpcs)
       freeze
     end
 
@@ -91,7 +95,8 @@ module SecurityBox
         stderr_limit: @stderr_limit,
         epoch_interval_ms: @epoch_interval_ms,
         env: @env,
-        mounts: @mounts
+        mounts: @mounts,
+        rpcs: @rpcs
       }
     end
 
@@ -99,12 +104,16 @@ module SecurityBox
     # hash). Two configurations with equal settings — regardless of how they
     # were built — share the same fingerprint; any #with change produces a
     # different one. Used to key profiles and, later, cached artifacts.
+    #
+    # RPC handlers are deliberately excluded: they are host-side callables
+    # (Procs) with no stable serialized identity, and including them would
+    # make the fingerprint depend on object addresses.
     def fingerprint
       Digest::SHA256.hexdigest(JSON.generate(canonical))
     end
 
     def canonical
-      to_h.merge(env: @env.sort.to_h)
+      to_h.except(:rpcs).merge(env: @env.sort.to_h)
     end
 
     # Mutable collector for the register DSL. Setter names match the
@@ -175,6 +184,26 @@ module SecurityBox
       #   c.mount_rw "host/path" => "/data"
       def mount_rw(mapping)
         add_mount(mapping, :read_write)
+      end
+
+      # Registers a guest-callable RPC handler (stage 6):
+      #   c.rpc "github.search" => ->(args) { ... }
+      #   c.rpc github_search: ->(args) { ... }
+      # Each call appends one handler; the per-call :rpcs override replaces
+      # the whole set. See SecurityBox::Rpcs for the validation rules.
+      def rpc(mapping = nil, **kwargs)
+        unless kwargs.empty?
+          raise InvalidConfiguration, 'rpc expects exactly one pair: c.rpc "name" => handler' unless kwargs.size == 1 && mapping.nil?
+
+          name, handler = kwargs.first
+          mapping = { name.to_s => handler }
+        end
+        unless mapping.is_a?(Hash) && mapping.size == 1
+          raise InvalidConfiguration,
+                'rpc expects exactly one pair: c.rpc "name" => handler'
+        end
+
+        @changes[:rpcs] = Array(@changes[:rpcs]) + [mapping]
       end
 
       private
@@ -319,6 +348,69 @@ module SecurityBox
 
         raise InvalidConfiguration,
               "too many mounts (#{mounts.size}); the limit is #{MAX_MOUNTS}"
+      end
+    end
+  end
+
+  # Validated collection of guest-callable RPC handlers (stage 6). A
+  # handler is a name => callable pair; `rpcs` in a Configuration is a
+  # frozen hash, so the value survives #with and #to_h.
+  #
+  # Handlers execute on the host (between guest steps, inside the RPC
+  # import) and are therefore host-only state: they are excluded from
+  # #fingerprint, and a Configuration carrying Procs is not
+  # Ractor-shareable — RactorPool rejects rpcs and strips them before a
+  # config crosses a Ractor boundary.
+  #
+  # Validation (InvalidConfiguration on any violation):
+  #   - raw is a Hash of name => handler, or an Array of one-pair hashes
+  #     (the register DSL appends one pair per c.rpc call)
+  #   - name: non-empty String, unique
+  #   - handler: anything responding to #call; it receives the
+  #     JSON-parsed request args and must return a JSON-serializable
+  #     value (non-serializable results surface as inspect strings)
+  #   - at most MAX_RPCS handlers
+  module Rpcs
+    MAX_RPCS = 64
+
+    class << self
+      # Validates + normalizes `raw` and returns a frozen
+      # name => handler hash.
+      def normalize(raw)
+        return {}.freeze if raw.nil?
+
+        pairs = case raw
+                when Hash then raw.entries
+                when Array
+                  unless raw.all? { |entry| entry.is_a?(Hash) && entry.size == 1 }
+                    raise InvalidConfiguration,
+                          "rpcs must be a Hash or an Array of one-pair hashes, " \
+                          "got #{raw.inspect[0, 80]}"
+                  end
+                  raw.flat_map(&:entries)
+                else
+                  raise InvalidConfiguration,
+                        "rpcs must be a Hash of name => handler, got #{raw.class}"
+                end
+
+        rpcs = {}
+        pairs.each do |name, handler|
+          unless name.is_a?(String) && !name.empty?
+            raise InvalidConfiguration, "rpc name must be a non-empty String, got #{name.inspect}"
+          end
+          unless handler.respond_to?(:call)
+            raise InvalidConfiguration,
+                  "rpc handler for #{name.inspect} must respond to #call, " \
+                  "got #{handler.inspect[0, 80]}"
+          end
+          raise InvalidConfiguration, "duplicate rpc name #{name.inspect}" if rpcs.key?(name)
+
+          rpcs[name] = handler
+        end
+        return rpcs.freeze if rpcs.size <= MAX_RPCS
+
+        raise InvalidConfiguration,
+              "too many rpcs (#{rpcs.size}); the limit is #{MAX_RPCS}"
       end
     end
   end

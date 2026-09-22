@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-21
+
+### Added
+
+- **Host RPC for code mode (stage 6)**: guest code can call host-registered
+  handlers with a regular, blocking function call:
+  `SB.call("github.search", q: "x")`. The call invokes the wasm import
+  (`sb`/`call`, declared by the new `sb_rpc` C extension statically linked
+  into the image) and blocks while the host executes the handler — no
+  callbacks, no rounds, no replay: the code reads as plain sequential Ruby
+  to the LLM that generated it.
+- `c.rpc "name" => handler` in the register DSL (and `rpcs:` in
+  `Configuration.build` / per-call `eval` overrides, replacing like `env:`).
+  Handlers receive the JSON-parsed request args (string keys) and must
+  return a JSON-serializable value (non-serializable results surface as
+  inspect strings). `SecurityBox::Rpcs` validates the set (non-empty unique
+  String names, `#call`-able handlers, at most 64); handlers are host-only
+  state — excluded from `#fingerprint` and unsupported on `RactorPool`
+  (Procs cannot cross a Ractor boundary; raises `InvalidConfiguration`).
+- `Result#rpcs`: a frozen transcript of the calls
+  (`{"name", "args", "ok", "result"|"error"}`), for agent debugging.
+- Sanitized failure mapping: a raising handler becomes a guest-rescuable
+  `SB::ToolError` (`SB::UnknownTool` for unregistered names, including the
+  "no handlers configured" case) carrying only `class` + `message` — no
+  backtrace, no host details. Unknown names never crash the host.
+- Bridge limits: at most 1000 RPC calls per eval and 1 MiB per response
+  (`SecurityBox::GuestRpc::MAX_CALLS`/`RESULT_LIMIT`), enforced host-side.
+
+### Changed
+
+- **Image build**: the image is now built from the pinned Ruby 4.0 source
+  with the guest gems of `lib/security_box/guest_ext` (Gemfile + `sb_rpc`)
+  statically linked (`rbwasm build` + `rbwasm pack`), replacing the packed
+  prebuilt release tarball. Size: 115MB → ~50MB; memory floor: ~95.5MiB →
+  ~36MiB (576 pages); first build downloads the Ruby source, wasi-sdk and
+  binaryen (cached in `build/`).
+- Epoch timer: the engine's native `start_epoch_interval` (a Ruby timer
+  thread cannot run while `invoke` holds the GVL — stage-4 evidence
+  reconfirmed). With a working timer, `timeout_ms` measurably covers boot +
+  guest compute + RPC handler time (the guest traps at the first epoch
+  check after the deadline passes; the handler itself is not interrupted).
+
+### Notes
+
+- The RPC import must be defined on every linker even when no handlers are
+  configured (the image declares the import); guest calls then receive a
+  clean, rescuable `SB::UnknownTool` instead of a failed instantiation.
+- Guest boot fuel is ~0.9e9 (measured with the new image, consistent with
+  the stage-3 calibration).
+
 ## [0.5.0] - 2026-09-20
 
 ### Added

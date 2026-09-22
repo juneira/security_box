@@ -1,9 +1,9 @@
 # Plan: `security_box` — sandbox for untrusted Ruby with ruby.wasm + wasmtime
 
-> **Status**: stages 1–5 are delivered and shipped as gem releases 0.1.0–0.5.0.
+> **Status**: stages 1–6 are delivered and shipped as gem releases 0.1.0–0.6.0.
 > This document reflects what actually shipped; the measured evidence lives in the
 > stage documents (`docs/plan/stages/`). The roadmap in §9 carries the remaining
-> scope: the image builder (M3, stage 6) and the CLI (M5, stage 7), with a backlog
+> scope: the image builder (M3, stage 7) and the CLI (M5, stage 8), with a backlog
 > of revisit triggers.
 
 ## 1. Goal
@@ -23,6 +23,11 @@ Core requirements:
 4. **Easy spawning and concurrency**: predictable per-eval cost, a bounded `Pool`
    for resource bounding, and real parallelism via `RactorPool` (`invoke` holds the
    GVL, so threads alone cannot parallelize executions).
+5. **Code mode (stage 6)**: guest code calls host-registered handlers
+   (`SB.call(name, args)`) with blocking semantics through a wasm import —
+   the foundation for running MCP tools from model-generated code.
+
+### Non-goals (v1)
 
 ### Non-goals (v1)
 
@@ -80,6 +85,12 @@ store.close
 - Structured result: the guest writes a token-signed JSON envelope to `/work/out.json`
   (read back and verified by the guest before exiting), with a stdout sentinel
   fallback; the host validates schema + token before surfacing anything.
+- Guest RPC (stage 6): the image statically links the `sb_rpc` C extension, which
+  declares the `sb`/`call` wasm import. `GuestRpc.define_import` defines it on every
+  linker (required even with no handlers, or instantiation fails); the closure
+  dispatches to the configuration's `rpcs:` handlers with per-eval state from
+  `caller.store_data`. `SB.call` blocks inside the import — the "code mode" path
+  (see `docs/plan/stages/stage_6.md`).
 - Limits in use: `consume_fuel` + `set_fuel`, `epoch_interruption` + `set_epoch_deadline`,
   `limits: { memory_size: }` (+ `linear_memory_limit_hit?`), stdout/stderr buffer
   capacities, `store.close` on teardown.
@@ -111,7 +122,8 @@ Configuration (immutable, #with, fingerprint, fuel_ms) ──► Registry (named
 | `EvalRun` | One `:oneshot` evaluation: WASI config (incl. mounts), limits, invoke, trap mapping, envelope read. Shared by `Sandbox` and Ractor workers. |
 | `Sandbox` | Thin, thread-safe wrapper over `EvalRun`. |
 | `Envelope` | Host-side schema + token validation (forged results → `:sandbox_error`). |
-| `Result` | `status`, `value`, `error` (with `backtrace`), `stdout`, `stderr`, `fuel_used`, `duration_ms`, `guest_duration_ms`. |
+| `GuestRpc` | The `sb`/`call` import: per-eval Store data (workdir, handlers, transcript), serving closure, sanitized failure mapping, call/result limits. |
+| `Result` | `status`, `value`, `error` (with `backtrace`), `stdout`, `stderr`, `fuel_used`, `duration_ms`, `guest_duration_ms`, `rpcs` (stage-6 call transcript). |
 | `Pool` | Bounded concurrency + sandbox reuse + metrics; serializes on the GVL (documented). |
 | `RactorPool` | Real parallelism: worker Ractors sharing one shareable Engine+Module; collector routes results by request id. |
 
@@ -130,9 +142,11 @@ SecurityBox.register(:reader) do |c|
   c.fuel 2_000_000_000                              # or c.fuel_ms 200 (rate-based)
   c.mount    "./data" => "/data"                    # read-only mount (default)
   c.mount_rw "./state" => "/state"                  # opt-in writable mount
+  c.rpc "github.search" => ->(args) { ... }         # host RPC handler (stage 6)
   c.timeout_ms 500
 end
 box = SecurityBox.spawn(:reader)                    # Sandbox from a profile
+box.eval("SB.call('github.search', q: 'x')")        # blocking call from the guest
 SecurityBox.spawn(:reader, timeout_ms: 100)         # per-call override via #with
 SecurityBox.eval(code, mounts: [...])               # per-call mounts override (replaces)
 
@@ -162,6 +176,7 @@ config.mounts               # frozen array of frozen {host:, guest:, mode:} hash
 | Stack overflow / recursion | rescued in the guest (`SystemStackError` → `:error` envelope) |
 | Host disk/RAM exhaustion | `Pool` hard cap on concurrent evals; `store.close` on every teardown |
 | Network | WASI p1 has no sockets (`require "socket"` → `LoadError`) |
+| Guest RPC abuse | Import always defined but stateless: handlers execute only names from the config's allowlist; args are guest-controlled by design (code mode) — authorization lives in the handler. Handler errors sanitized (`class`+`message`, no backtrace/paths), results JSON-only, ≤1000 calls/eval, ≤1MiB/response (`GuestRpc::MAX_CALLS`/`RESULT_LIMIT`) |
 | Host filesystem | No pre-opened directories beyond the sandbox-exclusive `/work` tmpdir (rw). Explicit mounts (`c.mount`/`c.mount_rw`, stage 5) are validated at registration (normalized absolute guest paths, no overlap with `/work`/`/usr`/`/src`, unique, ≤16) and re-checked per eval (host dir must exist); read-only mode is wasmtime-enforced (`Errno::EPERM` on writes), and symlinks inside a mount cannot escape the preopen root |
 | Processes / `system` / backticks / fork | Nonexistent in wasip1; the hardening prelude also neutralizes `system`, `exec`, `Kernel#spawn`, backticks, `IO.popen`, `Process.spawn`, `Kernel#open` (all raise `SecurityError`) |
 | stdout flood | `set_stdout_buffer(buf, capacity)` truncates at the configured limit |
@@ -245,13 +260,17 @@ lib/security_box/result.rb                # Result (+ worker_unavailable)
 lib/security_box/pool.rb                  # bounded pool of :oneshot sandboxes + metrics
 lib/security_box/ractor_pool.rb           # Ractor workers on a shareable Engine+Module
 lib/security_box/errors.rb                # Error, ImageMissing, InvalidConfiguration, PoolClosed
+lib/security_box/guest_rpc.rb             # host side of the guest RPC import (stage 6)
 lib/security_box/guest/main.rb            # packed entrypoint (_start): envelope + sentinel
 lib/security_box/guest/prelude.rb         # hardening: token capture, ENV scrub, API neutralization
+lib/security_box/guest/rpc.rb             # packed: SB.call + SB::ToolError/UnknownTool
+lib/security_box/guest_ext/               # guest Gemfile + sb_rpc native gem (C ext, wasm import)
 lib/security_box/version.rb
 lib/security_box/assets/security_box.wasm # packed image (not committed; repack task)
-Rakefile                                  # spec, security_box:build_image, verify_image
+Rakefile                                  # spec, security_box:build_image (rbwasm build + pack), verify_image
 bin/spike.rb                              # stage-1 spike (Q1–Q9)
 bin/spike_stage3*.rb, bin/spike_stage4_worker.rb  # calibration/Ractor/pooling/worker probes
+bin/spike_stage6_rpc.rb                   # stage-6 spike (blocking RPC import, 8/8 PASS)
 spec/…                                    # unit + integration + escape matrix
 ```
 
@@ -259,6 +278,9 @@ Not yet present (planned): `image.rb`/`image_builder.rb` (M3), `exe/security_box
 CLI (M5).
 
 Dependencies: `wasmtime` (runtime), `ruby_wasm` (build only), `json` (stdlib).
+Guest image gems: `sb_rpc` (C extension declaring the `sb`/`call` wasm import),
+declared in `lib/security_box/guest_ext/Gemfile` and statically linked by
+`rbwasm build`.
 
 ---
 
@@ -273,16 +295,18 @@ Dependencies: `wasmtime` (runtime), `ruby_wasm` (build only), `json` (stdlib).
 | 3 (0.3.0) | Profiles + calibration | `register`/`spawn`, `#fingerprint`, Ractor shareability evidence, memory floor, fuel calibration table, guest backtrace, verified envelope write |
 | 4 (0.4.0) | Concurrency | `:worker` mode rejected (GVL evidence), `Pool` + `RactorPool` (~1.9x at 4 workers), `fuel_ms`, `EvalRun` extraction |
 | 5 (0.5.0) | Folder mounts | `c.mount`/`c.mount_rw` (read-only by default), validation matrix, wasmtime-enforced RO (`EPERM`), symlink escapes blocked, embedded VFS not guest-writable (no prelude change), mount cost ~0 |
+| 6 (0.6.0) | Host RPC (code mode) | Blocking `SB.call` via the `sb`/`call` wasm import (`sb_rpc` C ext statically linked), `c.rpc` allowlist, sanitized failures, transcript on `Result#rpcs`, image rebuilt via `rbwasm build` (115MB→50MB, floor ~95.5→~36MiB); spike 8/8 (stage_6.md) |
 
-### Stage 6 — ImageBuilder and fingerprint-keyed caches (M3)
+### Stage 7 — ImageBuilder and fingerprint-keyed caches (M3)
 
 - `ImageBuilder`: ruby version, `:full`/`:minimal` profile, stdlib allowlist,
-  pure-Ruby gems baked into the image.
+  pure-Ruby gems baked into the image (generalizes the stage-6 `rbwasm build`
+  flow in the Rakefile).
 - Fingerprint-keyed image cache (`~/.cache/security_box/images/<sha>.wasm`) and
   compiled-module cache identity; explicit build step (`rake security_box:build`,
   `SecurityBox.build_all!`); `ImageMissing` when production forbids builds.
 
-### Stage 7 — CLI, docs, threat model (M5)
+### Stage 8 — CLI, docs, threat model (M5)
 
 - CLI `exe/security_box` (`eval`, `build`, `doctor`).
 - `docs/SECURITY.md` (threat model, incl. mounts), structured logs, optional
@@ -295,6 +319,12 @@ Dependencies: `wasmtime` (runtime), `ruby_wasm` (build only), `json` (stdlib).
   ~555ms image digest).
 - `:worker` mode — only when wasmtime-rb ships GVL-releasing/async WASI (stage 4 has
   the probes and evidence).
+- `RactorPool` + rpcs (mailbox design: worker closure → `Ractor.main <<` →
+  collector routes responses back to a per-request Queue) — sketch in
+  `docs/plan/stages/stage_6.md` §6, spike-gated fast-follow.
+- Per-RPC epoch deadline re-arm (proven possible in the spike via
+  `caller.store_data[:store]`) — only if slow handlers become common and
+  sizing `timeout_ms` over the whole eval turns out too coarse.
 - `RactorPool` hardening: worker restart after a crash, `Ractor#monitor`/`join`-based
   liveness instead of the pop deadline.
 - Pooling allocator — only if a pre-warming pool lands and RSS becomes a concern
@@ -319,6 +349,16 @@ Delivered:
   verified guest write beats a garbage overwrite.
 - **Configs**: `#with` never mutates; equal fingerprints share artifacts; profiles
   never mutate; pool bounding/shutdown; Ractor concurrency + trap recovery.
+
+**RPC matrix (stage 6)**: blocking round-trip (kwargs and hash forms) with
+JSON-parsed args (string keys); wall-clock time observed inside `SB.call`;
+handler failures → guest-rescuable `SB::ToolError` without backtrace; unknown
+names → `SB::UnknownTool`; the no-handlers case is also a clean guest error
+(never a failed instantiation); transcript frozen on `Result#rpcs` (nil when
+none); non-JSON handler results/args surface as inspect strings; oversized
+results → `SB::ToolError` ("too large"); per-call `rpcs:` override replaces;
+`Rpcs` validation matrix (names, `#call`, duplicates, limit, one-pair shape,
+symbol keys); `RactorPool` rejects rpcs; suite: 185 examples green.
 
 **Mount matrix (stage 5)**: reads work through a read-only mount (`File.read`,
 `Dir[]`, `File.open`, nested dirs) while writes fail with `Errno::EPERM` and the host
@@ -351,3 +391,10 @@ and a RactorPool eval carry mounts end to end.
    model (stage 7 `docs/SECURITY.md`) must spell out what a mount exposes.
 7. **Runtime dependency drift**: wasmtime-rb behavior (GVL, epoch semantics) is
    version-pinned in evidence; re-run the stage 4 probes on any dependency bump.
+8. **RPC handlers are host code inside `invoke`** (stage 6): a handler doing
+   blocking I/O releases the GVL, but the invoking thread is inside the wasm
+   call — handlers must be thread-safe under `Pool` concurrency, and their
+   wall-clock counts against `timeout_ms` (no per-RPC re-arm in v1).
+9. **Image build needs network** (stage 6): the first `rbwasm build` downloads
+   the Ruby source, wasi-sdk and binaryen (cached in `build/`); releases need a
+   prebuilt image as before.

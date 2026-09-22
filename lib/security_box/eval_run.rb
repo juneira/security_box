@@ -44,6 +44,13 @@ module SecurityBox
 
         Dir.mktmpdir("security_box") do |workdir|
           File.write(File.join(workdir, CODE_FILE), code)
+          # Per-eval RPC state (stage 6): the /work tmpdir plus the
+          # configuration's handlers (nil when none are configured — the
+          # import is still defined, guest calls get a rescuable error).
+          # The calls array doubles as the Result transcript.
+          rpc_data = GuestRpc.store_data(
+            workdir, config.rpcs.empty? ? nil : config.rpcs
+          )
           envelope = nil
           status = nil
           fuel_used = nil
@@ -52,6 +59,7 @@ module SecurityBox
           begin
             store = Wasmtime::Store.new(
               engine,
+              rpc_data,
               wasi_p1_config: build_wasi(workdir, stdout, stderr, config, token),
               limits: { memory_size: config.memory_size }
             )
@@ -70,7 +78,8 @@ module SecurityBox
             store&.close
           end
 
-          build_result(status, envelope, stdout, stderr, fuel_used, monotonic_ms - t0)
+          build_result(status, envelope, stdout, stderr, fuel_used,
+                       monotonic_ms - t0, rpc_data[:rpc]&.fetch(:calls))
         end
       end
 
@@ -145,12 +154,13 @@ module SecurityBox
         nil
       end
 
-      def build_result(status, envelope, stdout, stderr, fuel_used, duration_ms)
+      def build_result(status, envelope, stdout, stderr, fuel_used, duration_ms, rpc_calls = nil)
+        rpcs = rpc_calls && !rpc_calls.empty? ? rpc_calls.each(&:freeze).freeze : nil
         if envelope.nil?
           status = :sandbox_error if status == :ok
           return Result.new(
             status: status, stdout: stdout, stderr: stderr,
-            fuel_used: fuel_used, duration_ms: duration_ms
+            fuel_used: fuel_used, duration_ms: duration_ms, rpcs: rpcs
           )
         end
 
@@ -159,7 +169,7 @@ module SecurityBox
           Result.new(
             status: status, value: envelope["value"], stdout: stdout, stderr: stderr,
             fuel_used: fuel_used, duration_ms: duration_ms,
-            guest_duration_ms: envelope["duration_ms"]
+            guest_duration_ms: envelope["duration_ms"], rpcs: rpcs
           )
         elsif guest_memory_error?(guest_error)
           # The guest hit the store memory limit through the Ruby interpreter
@@ -168,13 +178,13 @@ module SecurityBox
           Result.new(
             status: :memory_limit, error: guest_error, stdout: stdout, stderr: stderr,
             fuel_used: fuel_used, duration_ms: duration_ms,
-            guest_duration_ms: envelope["duration_ms"]
+            guest_duration_ms: envelope["duration_ms"], rpcs: rpcs
           )
         else
           Result.new(
             status: :error, error: guest_error, stdout: stdout, stderr: stderr,
             fuel_used: fuel_used, duration_ms: duration_ms,
-            guest_duration_ms: envelope["duration_ms"]
+            guest_duration_ms: envelope["duration_ms"], rpcs: rpcs
           )
         end
       end

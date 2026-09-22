@@ -1,0 +1,10 @@
+source "https://rubygems.org"
+
+# Build tooling — excluded from the image by the packager (EXCLUDED_GEMS),
+# present here so `bundle exec rbwasm` works inside this bundle.
+gem "ruby_wasm", "~> 2.10.1"
+
+# Guest image gems (built into the wasm image by `rbwasm build`; see
+# Rakefile). Only guest-safe dependencies belong here — host-only gems
+# (wasmtime) must stay in the project Gemfile.
+gem "sb_rpc", path: "sb_rpc"

@@ -45,6 +45,8 @@ module SecurityBox
       raise ArgumentError, "size must be >= 1" if @size < 1
 
       @config = resolve_config(profile, options)
+      raise InvalidConfiguration, "rpcs are not supported on RactorPool (handlers cannot cross a Ractor boundary)" unless @config.rpcs.empty?
+
       @mutex = Mutex.new
       @pending = {} # request id => Queue
       @in_flight = Array.new(@size, 0)
@@ -64,10 +66,16 @@ module SecurityBox
 
     # Runs `code` on one of the workers and blocks until its Result arrives.
     # Per-call overrides follow Sandbox#eval (same Configuration#with rules).
+    #
+    # RPC handlers are not supported here (v1): they are host Procs that
+    # cannot cross a Ractor boundary. A configuration with rpcs raises
+    # InvalidConfiguration at construction.
     def eval(code, **overrides)
       raise PoolClosed, "pool is closed" if closed?
 
       config = overrides.empty? ? @config : @config.with(**overrides)
+      raise InvalidConfiguration, "rpcs are not supported on RactorPool (handlers cannot cross a Ractor boundary)" unless config.rpcs.empty?
+
       request = {
         id: next_id,
         code: code,
@@ -136,7 +144,14 @@ module SecurityBox
 
     def build_worker(engine, module_, worker_index)
       Ractor.new(engine, module_, worker_index, name: "security_box-worker-#{worker_index}") do |eng, mod, index|
-        linker = Wasmtime::Linker.new(eng).tap { |l| Wasmtime::WASI::P1.add_to_linker_sync(l) }
+        linker = Wasmtime::Linker.new(eng).tap do |l|
+          Wasmtime::WASI::P1.add_to_linker_sync(l)
+          # The image statically links the sb_rpc extension, so the
+          # "sb"/"call" import must be defined even though configs are
+          # stripped of rpcs before crossing the Ractor boundary
+          # (guest calls get a rescuable error via caller.store_data).
+          SecurityBox::GuestRpc.define_import(l)
+        end
         loop do
           request = Ractor.receive
           break if request == :security_box_stop

@@ -6,3 +6,6 @@ vendor/
 ruby-4.0-wasm32-unknown-wasip1-full/
 ruby-4.0-wasm32-unknown-wasip1-full.tar.gz
 Gemfile.lock
+# ruby.wasm build artifacts (rbwasm build, stage 6)
+build/
+rubies/

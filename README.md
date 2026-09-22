@@ -15,9 +15,12 @@ tries to escape.
 
 ## How it works
 
-1. A `ruby.wasm` image is packed with the Ruby runtime + stdlib + a small guest
-   entrypoint (`lib/security_box/guest/main.rb`) plus a hardening prelude
-   (`lib/security_box/guest/prelude.rb`).
+1. A `ruby.wasm` image is built from the pinned Ruby 4.0 source with the guest
+   gems of `lib/security_box/guest_ext` statically linked (`rbwasm build`),
+   then packed with the guest entrypoint (`lib/security_box/guest/main.rb`)
+   plus a hardening prelude (`lib/security_box/guest/prelude.rb`). The
+   `sb_rpc` gem declares the `sb`/`call` wasm import used by the host RPC
+   channel (see "Host RPC (code mode)" below).
 2. On every `#eval`, the host creates an exclusive tmpdir, writes the user code to it, and
    mounts it read-write as `/work` inside the sandbox. It also generates a per-eval
    random token and passes it to the guest via `SB_TOKEN`.
@@ -50,23 +53,24 @@ gem "security_box"
 ```
 
 The gem ships a prebuilt sandbox image (`lib/security_box/assets/security_box.wasm`,
-about 110MB), so no network access or build tools are needed at install or at
+about 50MB), so no network access or build tools are needed at install or at
 runtime.
 
 ### Rebuilding the image (development only)
 
-If you change `lib/security_box/guest/*.rb` or bump the pinned ruby.wasm
-release, repack the sandbox image:
+If you change `lib/security_box/guest/*.rb` or anything under
+`lib/security_box/guest_ext/` (guest gems), rebuild the sandbox image:
 
 ```bash
 bundle install
 bundle exec rake security_box:build_image
 ```
 
-This downloads the pinned ruby.wasm release (`2.10.1`, see the `Rakefile`) and
-packs it with the guest script into `lib/security_box/assets/security_box.wasm`.
-The task skips repacking when the image is already fresh. The image is not
-committed to git.
+The first build downloads the Ruby source tarball, wasi-sdk and binaryen into
+`build/` (network required, cached afterwards), builds Ruby 4.0 with the guest
+gems statically linked and packs `lib/security_box/guest` as `/src`. The task
+skips rebuilding when the image is already fresh. The image is not committed to
+git.
 
 You can point the library at a different image with the `SECURITY_BOX_IMAGE`
 environment variable or by passing `image_path:` in the configuration — useful
@@ -156,6 +160,45 @@ result.error["backtrace"]        # => ["sandbox:1:in 'Object#boom'", "sandbox:1:
 The backtrace contains guest frames only (sandbox-internal locations, capped at
 20 frames) — nothing from the host filesystem leaks.
 
+### Host RPC (code mode)
+
+Guest code can call host-registered handlers with a regular, **blocking**
+function call — the shape model-generated "code mode" agents need:
+
+```ruby
+SecurityBox.register(:agent) do |c|
+  c.rpc "github.search" => ->(args) { mcp.call_tool("github", "search", args) }
+  c.rpc "github.get"    => ->(args) { mcp.call_tool("github", "get_file", args) }
+  c.fuel_ms 200
+  c.timeout_ms 5_000   # covers boot + guest compute + handler time
+end
+
+box = SecurityBox.spawn(:agent)
+box.eval(<<~CODE)
+  hits = SB.call("github.search", q: "ruby wasm").items
+  SB.call("github.get", path: hits.first.path)
+CODE
+```
+
+- `SB.call(name, args)` blocks inside the sandbox (a wasm import provided by
+  the statically linked `sb_rpc` gem) while the host executes the handler;
+  from the guest's perspective it is just a function returning a value.
+- Handlers receive the JSON-parsed args (string keys) and must return a
+  JSON-serializable value (non-serializable results surface as inspect
+  strings).
+- A raising handler becomes a guest-rescuable `SB::ToolError`
+  (`SB::UnknownTool` for unregistered names) carrying only `class` +
+  `message` — no backtrace, no host details. Calling an RPC on a sandbox
+  with no handlers configured is also a clean, rescuable error.
+- `Result#rpcs` carries the frozen per-eval transcript
+  (`{"name", "args", "ok", "result"|"error"}`) for agent debugging.
+- Limits: at most 1000 calls per eval and 1MiB per response.
+- Handlers are host-only state: excluded from `#fingerprint`, not supported
+  on `RactorPool` (they cannot cross a Ractor boundary), and must be
+  thread-safe when a `Pool` is used concurrently.
+- Per-call override (replaces, like `env:`):
+  `SecurityBox.eval(code, rpcs: { "calc" => ->(args) { ... } })`.
+
 ### Named profiles
 
 Reusable configurations registered once and spawned as often as needed:
@@ -240,7 +283,8 @@ config = SecurityBox::Configuration.build(
   stderr_limit: 1 << 16,            # stderr capture capacity in bytes
   epoch_interval_ms: 25,            # epoch timer granularity
   env: { "LANG" => "C" },           # guest environment (empty by default)
-  mounts: []                        # host-folder mounts (see "Folder mounts")
+  mounts: [],                       # host-folder mounts (see "Folder mounts")
+  rpcs: {}                          # name => callable host RPC handlers
 )
 
 lean = config.with(timeout_ms: 500, fuel: 5_000_000)
@@ -275,6 +319,10 @@ string.
 | `Thread.new` | `NotImplementedError` (WASI p1 has no threads) |
 | `require "socket"` | `LoadError` (no network) |
 | `ENV` | `{}` (token read and scrubbed by the prelude) |
+| `SB.call("missing")` | `SB::UnknownTool` (guest-rescuable; host never crashes) |
+| `SB.call` with no handlers configured | `SB::UnknownTool` ("no RPC handlers are configured…") |
+| handler raising | guest sees `SB::ToolError` with `class` + `message` only |
+| >1000 RPC calls or >1MiB result | `SB::ToolError` (guest-rescuable, host-side enforced) |
 | forge `out.json` via `at_exit` / fake sentinel | rejected (token mismatch → `:sandbox_error`) |
 | infinite loop | killed by epoch deadline or fuel budget |
 
@@ -291,9 +339,10 @@ Notes:
 - Ractor: wasmtime `Engine`/`Module` are Ractor-shareable and Ractors run wasm in
   parallel — measured ≈1.9x wall-time speedup at 4 workers on 6 cores through
   `RactorPool` (see `docs/plan/stages/stage_3.md` and `stage_4.md`).
-- Memory: the packed image declares a 1528-page (~95.5 MiB) minimum; `memory_size`
-  below that fails instantiation (reported as `:sandbox_error`). Practical minimum is
-  ~128–144MB for small workloads; the 512MB default leaves comfortable headroom.
+- Memory: the image (stage-6 `rbwasm build` flow) declares a ~576-page (~36 MiB)
+  minimum; `memory_size` below that fails instantiation (reported as
+  `:sandbox_error`). Practical minimum is ~48–64MB for small workloads; the
+  512MB default leaves comfortable headroom.
 - Fuel budgeting: compute workloads burn ~4–8e9 fuel/s (tight loops up to ~8.4e9/s)
   and every eval costs ~1e9 fuel for boot — see the calibration table in
   `docs/plan/stages/stage_3.md`. Consequently `fuel` below ~1e9 cannot even boot, and
@@ -397,3 +446,6 @@ bundle exec ruby bin/spike.rb
   `fuel_ms`)
 - `docs/plan/stages/stage_5.md` — stage 5 findings (folder mounts: read-only
   enforcement, reserved-path collisions, symlink escapes, mount cost)
+- `docs/plan/stages/stage_6.md` — stage 6 findings (blocking host RPC via a
+  wasm import, `SB.call` code-mode contract, epoch semantics, new image
+  build flow)
