@@ -433,6 +433,12 @@ bundle exec ruby bin/spike.rb
   LLM agent built with [RubyLLM](https://github.com/crmne/ruby_llm) whose code-execution
   tool runs model-generated Ruby inside the sandbox, demonstrating folder mounts
   (read-only vs read-write) end to end.
+- [`samples/ruby_llm/context7_code_mode`](samples/ruby_llm/context7_code_mode/README.md) —
+  a RubyLLM code-mode agent whose sandbox code reaches the hosted
+  [Context7](https://context7.com) MCP server through `SB.call`: host RPC
+  handlers proxy the MCP tools (streamable HTTP + bearer auth), so the API
+  key never crosses the sandbox boundary. Includes a no-LLM smoke script
+  that exercises the RPC↔MCP wiring.
 
 ## Documentation
 
