@@ -8,7 +8,8 @@ RSpec::Core::RakeTask.new(:spec)
 # Stage 6 (host RPC): the image is no longer packed from a prebuilt ruby.wasm
 # release tarball. It is built from the pinned Ruby source with the guest
 # gems of lib/security_box/guest_ext (sb_rpc — the C extension that declares
-# the "sb"/"call" wasm import) statically linked, via `rbwasm build`. The
+# the "sb"/"call" wasm import — and rspec, for guest test runs) statically
+# linked, via `rbwasm build`. The
 # guest entrypoint dir is then added to the VFS with `rbwasm pack`.
 #
 # First build downloads the Ruby source tarball, wasi-sdk and binaryen into
@@ -77,6 +78,7 @@ task default: :spec
 
 def image_fresh?
   return false unless File.exist?(IMAGE_PATH)
+  return false unless File.exist?(File.join(GUEST_EXT_DIR, "Gemfile.lock"))
 
   mtime = File.mtime(IMAGE_PATH)
   guest_files.all? { |f| mtime >= File.mtime(f) } &&
@@ -84,6 +86,9 @@ def image_fresh?
 end
 
 def guest_files
-  Dir["#{GUEST_DIR}/*.rb"] + Dir["#{GUEST_EXT_DIR}/**/*.{rb,c,gemspec}"] +
-    [File.join(GUEST_EXT_DIR, "Gemfile")]
+  files = Dir["#{GUEST_DIR}/*.rb"] + Dir["#{GUEST_EXT_DIR}/**/*.{rb,c,gemspec}"] +
+          [File.join(GUEST_EXT_DIR, "Gemfile")]
+  lockfile = File.join(GUEST_EXT_DIR, "Gemfile.lock")
+  files << lockfile if File.exist?(lockfile)
+  files
 end

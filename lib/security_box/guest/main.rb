@@ -100,4 +100,8 @@ end
 # above; must load after it.
 require_relative "rpc"
 
+# Guest RSpec runner (SB.run_rspec) — also reopens SB; RSpec itself is
+# required lazily on the first call.
+require_relative "rspec"
+
 SB.run

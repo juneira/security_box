@@ -1,0 +1,7 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# Local checkout: this sample demonstrates the RSpec-enabled image, which is
+# built from this repository (see the root README, "Rebuilding the image").
+gem "security_box", path: "../.."

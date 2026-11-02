@@ -8,3 +8,8 @@ gem "ruby_wasm", "~> 2.10.1"
 # Rakefile). Only guest-safe dependencies belong here — host-only gems
 # (wasmtime) must stay in the project Gemfile.
 gem "sb_rpc", path: "sb_rpc"
+
+# Bundled so guest code can run spec suites mounted at /work (see
+# lib/security_box/guest/rspec.rb and SB.run_rspec). RSpec is pure Ruby and
+# adds no native extensions, so it does not change the Ruby build cache key.
+gem "rspec", "~> 3.13"

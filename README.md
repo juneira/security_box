@@ -20,7 +20,8 @@ tries to escape.
    then packed with the guest entrypoint (`lib/security_box/guest/main.rb`)
    plus a hardening prelude (`lib/security_box/guest/prelude.rb`). The
    `sb_rpc` gem declares the `sb`/`call` wasm import used by the host RPC
-   channel (see "Host RPC (code mode)" below).
+   channel (see "Host RPC (code mode)" below), and RSpec is bundled so guest
+   code can run spec suites (see "Running RSpec inside the sandbox").
 2. On every `#eval`, the host creates an exclusive tmpdir, writes the user code to it, and
    mounts it read-write as `/work` inside the sandbox. It also generates a per-eval
    random token and passes it to the guest via `SB_TOKEN`.
@@ -53,7 +54,7 @@ gem "security_box"
 ```
 
 The gem ships a prebuilt sandbox image (`lib/security_box/assets/security_box.wasm`,
-about 50MB), so no network access or build tools are needed at install or at
+about 52MB), so no network access or build tools are needed at install or at
 runtime.
 
 ### Rebuilding the image (development only)
@@ -269,6 +270,50 @@ Security notes:
 - Mounted content can also be **written by the guest** in `mount_rw` mounts —
   treat a writable mount as part of the guest's blast radius.
 
+### Running RSpec inside the sandbox
+
+The image bundles RSpec (`~> 3.13`), so guest code can run a spec suite from a
+mounted project. `SB.run_rspec` loads RSpec lazily, runs it with `HOME` and cwd
+set to a writable directory, and returns the exit status (`0` = all examples
+passed) instead of exiting the guest:
+
+```ruby
+box = SecurityBox.spawn(
+  timeout_ms: 30_000,
+  fuel_ms: 20_000,
+  mounts: [{ host: "./project", guest: "/project", mode: :read_only }]
+)
+
+result = box.eval(<<~RUBY)
+  SB.run_rspec("--no-color", "-I", "/project/lib", "/project/spec",
+               chdir: "/project")
+RUBY
+
+result.value   # => 0
+result.stdout  # => RSpec output
+```
+
+`chdir:` defaults to `/work` (the sandbox tmpdir). Use it when the suite needs
+`.rspec`, relative paths or status files from the mounted project; mount the
+project read-write if RSpec must persist them.
+
+You can also call RSpec directly:
+
+```ruby
+require "/bundle/setup.rb"
+require "rspec/core"
+RSpec::Core::Runner.run(["--no-color", "/work/spec"], $stderr, $stdout)
+```
+
+Notes:
+
+- Specs need a larger `timeout_ms`/`fuel_ms` than trivial evals; size them for
+  the whole suite, not for a single expression.
+- The guest has no process APIs, so RSpec features that spawn processes
+  (external formatters, `--bisect`-style workflows) are unavailable.
+- `/work` is the sandbox's own writable tmpdir and cannot be used as a mount
+  target; mount projects at another path (for example `/project`).
+
 ### Configuration
 
 `SecurityBox::Configuration` is immutable; use `.build` to create and `#with` to derive:
@@ -439,6 +484,11 @@ bundle exec ruby bin/spike.rb
   handlers proxy the MCP tools (streamable HTTP + bearer auth), so the API
   key never crosses the sandbox boundary. Includes a no-LLM smoke script
   that exercises the RPC↔MCP wiring.
+- [`samples/rspec_sandbox`](samples/rspec_sandbox/README.md) — runs an existing
+  RSpec suite inside the sandbox: the library and its spec live in `ruby_src/`,
+  are mounted read-only and run with `/work` as cwd via `SB.run_rspec`. The
+  suite includes one deliberately failing example, showing how failures reach
+  the caller through `Result#value` and `Result#stdout`.
 
 ## Documentation
 

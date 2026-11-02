@@ -106,10 +106,10 @@ RSpec.describe SecurityBox::Sandbox do
 
       it "maps a guest NoMemoryError to :memory_limit" do
         # 64MB boots (floor ~36MiB on the stage-6 image) but is too small
-        # for a 1MB buffer workload: the Ruby interpreter raises
+        # for an 8MB buffer workload: the Ruby interpreter raises
         # NoMemoryError before the wasm limit is reached.
         result = sandbox.eval(
-          'buf = +""; 1024.times { buf << ("x" * 1024) }; buf.bytesize',
+          'buf = +""; 8192.times { buf << ("x" * 1024) }; buf.bytesize',
           memory_size: 64 * 1024 * 1024, timeout_ms: 15_000
         )
 

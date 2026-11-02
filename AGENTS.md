@@ -23,3 +23,5 @@ Rules and conventions of this project for agents and collaborators.
 - The built image (`lib/security_box/assets/security_box.wasm`) is not committed
   to git; rebuild after changing `lib/security_box/guest/*.rb` or anything
   under `lib/security_box/guest_ext/` (guest gems).
+- The image bundles RSpec; guest code can run specs with `SB.run_rspec`
+  (see `lib/security_box/guest/rspec.rb`).
