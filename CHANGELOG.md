@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-02
+
+### Added
+
+- RSpec is bundled into the sandbox image (`lib/security_box/guest_ext`), so
+  guest code can run spec suites from mounted projects. `SB.run_rspec` loads
+  RSpec lazily, runs it with `HOME`/cwd set to a writable directory and
+  returns the exit status instead of exiting the guest. The image grows by
+  ~2MB (about 52MB total); boot time is unchanged because RSpec is only
+  required on first use.
+- `samples/rspec_sandbox`: a runnable sample that mounts a `ruby_src/` folder
+  read-only, runs its existing spec with `/work` as cwd through
+  `SB.run_rspec`, and includes a deliberately failing example to show how
+  failures reach the caller (`Result#value` + `Result#stdout`).
+
+### Changed
+
+- `Rakefile`: the guest image freshness check now includes
+  `lib/security_box/guest_ext/Gemfile.lock`.
+
 ## [0.6.0] - 2026-09-21
 
 ### Added
